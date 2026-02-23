@@ -325,8 +325,14 @@ struct Args {
     root_dir: PathBuf,
 
     /// Path to slang-test executable (relative to root_dir or absolute)
-    #[arg(long, default_value = "build/Debug/bin/slang-test")]
-    slang_test: PathBuf,
+    /// If not specified, auto-detects the newest build
+    #[arg(long)]
+    slang_test: Option<PathBuf>,
+
+    /// Build type to use: debug, release, or relwithdebinfo
+    /// If not specified, uses the newest available build
+    #[arg(long)]
+    build_type: Option<String>,
 
     /// Test directory (relative to root_dir or absolute)
     #[arg(long, default_value = "tests")]
@@ -1536,7 +1542,7 @@ impl TestRunner {
     }
 
     fn run_with_prefixes(&self) -> Result<()> {
-        let mut cmd = Command::new(&self.args.slang_test);
+        let mut cmd = Command::new(self.args.slang_test.as_ref().unwrap());
 
         if self.args.hide_ignored {
             cmd.arg("-hide-ignored");
@@ -1830,7 +1836,7 @@ impl TestRunner {
 
         if !work_pool.is_empty() {
             for _ in 0..self.args.jobs {
-                let slang_test = self.args.slang_test.clone();
+                let slang_test = self.args.slang_test.as_ref().unwrap().clone();
                 let extra_args = self.args.extra_args.clone();
                 let stats = stats.clone();
                 let failures = failures.clone();
@@ -1909,7 +1915,7 @@ impl TestRunner {
                         let extra_to_spawn = (num_cpus - total_running).min(4);
                         for _ in 0..extra_to_spawn {
                             if let Some(batch) = work_pool.try_get_medium_batch() {
-                                let slang_test = self.args.slang_test.clone();
+                                let slang_test = self.args.slang_test.as_ref().unwrap().clone();
                                 let extra_args = self.args.extra_args.clone();
                                 let stats = stats.clone();
                                 let failures = failures.clone();
@@ -2289,7 +2295,7 @@ impl TestRunner {
                 }
                 println!();
             } else {
-                print!("{}", self.args.slang_test.display());
+                print!("{}", self.args.slang_test.as_ref().unwrap().display());
                 for file in &test_files {
                     print!(" \"{}\"", file);
                 }
@@ -2299,6 +2305,49 @@ impl TestRunner {
 
         println!("{}", "=".repeat(70));
     }
+}
+
+/// Detect available slang-test builds and return (path, build_type, all_available)
+fn detect_slang_test_build(root_dir: &PathBuf, preferred_type: Option<&str>) -> Result<(PathBuf, String, Vec<(String, PathBuf, std::time::SystemTime)>)> {
+    let build_types = [
+        ("debug", "build/Debug/bin/slang-test"),
+        ("release", "build/Release/bin/slang-test"),
+        ("relwithdebinfo", "build/RelWithDebInfo/bin/slang-test"),
+    ];
+
+    let mut available: Vec<(String, PathBuf, std::time::SystemTime)> = Vec::new();
+
+    for (name, rel_path) in &build_types {
+        let path = root_dir.join(rel_path);
+        if path.exists() {
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                if let Ok(modified) = metadata.modified() {
+                    available.push((name.to_string(), path, modified));
+                }
+            }
+        }
+    }
+
+    if available.is_empty() {
+        anyhow::bail!("No slang-test executable found in build/{{Debug,Release,RelWithDebInfo}}/bin/");
+    }
+
+    // If user specified a build type, use it
+    if let Some(preferred) = preferred_type {
+        if let Some((_, path, _)) = available.iter().find(|(name, _, _)| name == preferred) {
+            return Ok((path.clone(), preferred.to_string(), available));
+        } else {
+            anyhow::bail!("Build type '{}' not found. Available: {}",
+                preferred,
+                available.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>().join(", "));
+        }
+    }
+
+    // Sort by modification time (newest first)
+    available.sort_by(|a, b| b.2.cmp(&a.2));
+
+    let (build_type, path, _) = available[0].clone();
+    Ok((path, build_type, available))
 }
 
 fn main() -> Result<()> {
@@ -2319,9 +2368,36 @@ fn main() -> Result<()> {
 
     let root_dir = args.root_dir.canonicalize().unwrap_or(args.root_dir.clone());
 
-    if args.slang_test.is_relative() {
-        args.slang_test = root_dir.join(&args.slang_test);
-    }
+    // Detect or resolve slang-test executable
+    let slang_test_path = if let Some(path) = args.slang_test {
+        // User specified a path explicitly
+        if path.is_relative() {
+            root_dir.join(&path)
+        } else {
+            path
+        }
+    } else {
+        // Auto-detect build
+        let (path, build_type, available) = detect_slang_test_build(&root_dir, args.build_type.as_deref())?;
+
+        // Show notice if multiple builds are available
+        if available.len() > 1 {
+            eprintln!("Auto-detected {} build (newest): {}", build_type, path.display());
+            let others: Vec<_> = available.iter()
+                .filter(|(name, _, _)| name != &build_type)
+                .map(|(name, _, _)| name.as_str())
+                .collect();
+            if !others.is_empty() {
+                eprintln!("  Other available: {}", others.join(", "));
+                eprintln!("  Use --build-type <type> or --slang-test <path> to choose a specific build");
+            }
+        }
+
+        path
+    };
+
+    // Update args with the resolved path
+    args.slang_test = Some(slang_test_path);
 
     std::env::set_current_dir(&root_dir)
         .with_context(|| format!("Failed to change to root directory: {}", root_dir.display()))?;
