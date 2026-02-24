@@ -542,7 +542,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "slang-test-runner"
+name = "slang-test-interceptor"
 version = "0.1.0"
 dependencies = [
  "anyhow",

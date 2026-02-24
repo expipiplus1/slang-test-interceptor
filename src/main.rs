@@ -15,7 +15,7 @@ use types::{flush_event_log, init_event_log, log_event};
 // ============================================================================
 
 #[derive(Parser, Debug)]
-#[command(name = "slang-test-runner")]
+#[command(name = "sti")]
 #[command(about = "A parallel test runner for slang-test with better output")]
 pub struct Args {
     /// Root directory of the slang project (defaults to current directory)

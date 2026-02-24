@@ -1359,7 +1359,7 @@ impl TestRunner {
 
             let has_file_tests = test_files.iter().any(|f| f.ends_with(".slang") || f.ends_with(".hlsl") || f.ends_with(".glsl") || f.ends_with(".c"));
 
-            let exe = std::env::args().next().unwrap_or_else(|| "slang-test-runner".to_string());
+            let exe = std::env::args().next().unwrap_or_else(|| "sti".to_string());
             if has_file_tests {
                 print!("{}", exe);
                 if self.args.root_dir != PathBuf::from(".") {

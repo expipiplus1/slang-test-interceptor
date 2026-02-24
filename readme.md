@@ -1,4 +1,4 @@
-# Slang test runner
+# Slang Test Interceptor
 
 A wrapper for slang-test which implements several enhancements:
 
@@ -11,45 +11,63 @@ A wrapper for slang-test which implements several enhancements:
 
 ```bash
 # Run all tests from the slang directory
-slang-test-runner -C /path/to/slang
+sti -C /path/to/slang
 
-# Run specific test files
-slang-test-runner -C /path/to/slang tests/compute/array-param.slang
+# Run tests matching a regex filter (infix match)
+sti -C /path/to/slang diagnostic
 
 # Run tests matching a prefix
-slang-test-runner -C /path/to/slang tests/compute/
+sti -C /path/to/slang '^tests/compute'
+
+# Run multiple filter patterns (union - matches ANY)
+sti -C /path/to/slang '^tests/compute' '^tests/autodiff'
 
 # Run internal unit tests
-slang-test-runner -C /path/to/slang slang-unit-test-tool/
+sti -C /path/to/slang slang-unit-test-tool
+
+# List tests that would be run without running them
+sti -C /path/to/slang --dry-run diagnostic
 
 # Customize parallelism
-slang-test-runner -C /path/to/slang -j 8 tests/compute/
+sti -C /path/to/slang -j 8 '^tests/compute'
 
 # Use difft for side-by-side diffs
-slang-test-runner -C /path/to/slang --diff difft tests/compute/
+sti -C /path/to/slang --diff difft '^tests/compute'
+
+# Ignore tests matching a pattern
+sti -C /path/to/slang --ignore 'cuda' --ignore 'metal'
 
 # Pass extra arguments to slang-test
-slang-test-runner -C /path/to/slang tests/compute/ -- -api vk
+sti -C /path/to/slang '^tests/compute' -- -api vk
 ```
 
 ## Options
 
+### Common options
+
+- `<FILTERS>` - Regex patterns to filter tests (union: test runs if it matches ANY filter). Examples: `diagnostic` (infix), `^tests/compute` (prefix), `\.slang$` (suffix). If empty, runs all tests.
 - `-C, --root-dir <PATH>` - Root directory of the slang project (default: current directory)
-- `--slang-test <PATH>` - Path to slang-test executable (default: auto-detects newest build from build/{Debug,Release,RelWithDebInfo}/bin/)
-- `--build-type <TYPE>` - Build type to use: debug, release, or relwithdebinfo (default: newest available)
-- `--test-dir <PATH>` - Test directory for file discovery (default: tests)
 - `-j, --jobs <N>` - Number of parallel workers (default: number of CPUs)
-- `--batch-size <N>` - Maximum tests per slang-test invocation (default: 100)
-- `--batch-duration <SECS>` - Target batch duration in seconds when timing data is available (default: 10.0)
+- `--dry-run` - List tests that would be run without actually running them
+- `--ignore <PATTERN>` - Ignore tests matching regex pattern (can be specified multiple times; union: ignored if matches ANY)
+- `--diff <TOOL>` - Diff tool for expected/actual differences: `none`, `diff`, `difft` (default: `diff`)
+- `-v, --verbose` - Verbose output: show batch reproduction commands for slow batches, extended slow-test report with per-backend timing
+- `-- <ARGS>` - Additional arguments to pass directly to slang-test (e.g., `-- -api vk`)
+
+### Build selection
+
+- `--slang-test <PATH>` - Path to slang-test executable (default: auto-detects newest build)
+- `--build-type <TYPE>` - Build type to use: debug, release, or relwithdebinfo (default: newest available)
+
+### Advanced options
+
 - `--retries <N>` - Number of retries for failed tests (default: 2)
 - `--hide-ignored` - Hide ignored tests from output
-- `--ignore <PATTERN>` - Ignore tests matching pattern (can be specified multiple times)
-- `--diff <TOOL>` - Diff tool for showing expected/actual differences: `none`, `diff`, `difft` (default: `diff`)
-- `-v, --verbose` - Verbose output: show batch reproduction commands for slow batches, extended slow-test report with per-backend timing
+- `--batch-size <N>` - Maximum tests per slang-test invocation (default: 100)
+- `--batch-duration <SECS>` - Target batch duration in seconds when timing data is available (default: 10.0)
 - `--no-timing-cache` - Ignore cached timing data for scheduling and ETA
 - `--adaptive` - Adaptive load balancing: spawn extra workers when CPU is underutilized
 - `--event-log <PATH>` - Write CSV event log for performance debugging
-- `-- <ARGS>` - Additional arguments to pass directly to slang-test
 
 When stderr is not a TTY (e.g., in CI or when piped), output automatically switches to machine-readable format: no carriage returns, no terminal clearing, sparse progress updates.
 
@@ -65,9 +83,9 @@ During execution, a progress line updates in place showing:
 - Elapsed time and ETA
 - `[running/remaining]` batches - helps identify parallelism issues
 
-With `--machine-output`, progress is printed on separate lines every 100 tests without carriage returns:
+When stderr is not a TTY (CI, piped output), progress is printed on separate lines:
 ```
-[467/3112] 131 passed, 0 failed, 336 ignored (7.5s) [24/98 batches]
+[467/3112] 131 passed, 0 failed, 336 ignored (7.5s) [24/98]
 ```
 
 At completion, a summary shows:
@@ -185,7 +203,7 @@ Instead of pre-creating batches, the runner uses a dynamic work pool that worker
 
 2. **Slow-first scheduling**: Files are sorted by predicted duration (longest first) and workers preferentially pick slower files. This prevents the "long tail" problem where one worker is stuck on slow tests at the end.
 
-3. **End-game single files**: When few files remain (less than 2× worker count), files are dispatched individually for maximum parallelism.
+3. **End-game single files**: When few files remain (less than 2x worker count), files are dispatched individually for maximum parallelism.
 
 4. **Retry integration**: Failed tests go back into the same pool, automatically getting picked up by available workers.
 
@@ -209,13 +227,15 @@ The runner maintains a cache of test execution times to optimize scheduling:
 
 ### State location
 
-- Linux: `~/.local/state/slang-test-runner/timing.json`
-- macOS: `~/Library/Application Support/slang-test-runner/timing.json`
-- Windows: `%LOCALAPPDATA%\slang-test-runner\timing.json`
+- Linux: `~/.local/state/slang-test-interceptor/timing.json`
+- macOS: `~/Library/Application Support/slang-test-interceptor/timing.json`
+- Windows: `%LOCALAPPDATA%\slang-test-interceptor\timing.json`
 
 The state is automatically created and updated. Delete it to reset timing estimates.
 
 ## How it works
+
+Test discovery uses `slang-test -dry-run` to enumerate all available tests (both file-based and internal tests). This ensures the runner knows exactly which tests exist without needing to scan the filesystem.
 
 `slang-test` can be run over specific test cases in a single threaded mode like `slang-test tests/foo/bar.slang tests/baz/qux.slang`
 
@@ -225,10 +245,6 @@ There might be several tests per test file, some of which are synthesized and so
 
 There are also internal tests not represented by files, these are called `slang-unit-test-tool/modulePtr.internal` or similar.
 
-Tests might be in .slang, .hlsl, .glsl, or .c files in the tests directory.
-
-See `slang-test -h` for the full list of options.
-
 At the end it will output a command which will run all the non-passing and non-ignored tests.
 
 ## Building
@@ -237,4 +253,4 @@ At the end it will output a command which will run all the non-passing and non-i
 cargo build --release
 ```
 
-The binary will be at `target/release/slang-test-runner`.
+The binary will be at `target/release/sti`.

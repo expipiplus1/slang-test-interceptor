@@ -96,11 +96,11 @@ pub fn flush_event_log() {
 // State Directory
 // ============================================================================
 
-/// Get the state directory path (~/.local/state/slang-test-runner or XDG equivalent)
+/// Get the state directory path (~/.local/state/slang-test-interceptor or XDG equivalent)
 pub fn get_state_dir() -> Option<PathBuf> {
     dirs::state_dir()
         .or_else(|| dirs::data_local_dir()) // Fallback for macOS/Windows
-        .map(|p| p.join("slang-test-runner"))
+        .map(|p| p.join("slang-test-interceptor"))
 }
 
 // ============================================================================
