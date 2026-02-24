@@ -105,11 +105,6 @@ impl TestId {
         }
         s
     }
-
-    /// Get just the base file path (without variant/syn/api)
-    pub fn base_path(&self) -> &str {
-        &self.path
-    }
 }
 
 impl std::fmt::Display for TestId {
