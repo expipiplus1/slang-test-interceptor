@@ -35,17 +35,23 @@ slang-test-runner -C /path/to/slang tests/compute/ -- -api vk
 ## Options
 
 - `-C, --root-dir <PATH>` - Root directory of the slang project (default: current directory)
-- `--slang-test <PATH>` - Path to slang-test executable (default: build/Debug/bin/slang-test)
+- `--slang-test <PATH>` - Path to slang-test executable (default: auto-detects newest build from build/{Debug,Release,RelWithDebInfo}/bin/)
+- `--build-type <TYPE>` - Build type to use: debug, release, or relwithdebinfo (default: newest available)
 - `--test-dir <PATH>` - Test directory for file discovery (default: tests)
 - `-j, --jobs <N>` - Number of parallel workers (default: number of CPUs)
-- `--batch-size <N>` - Tests per slang-test invocation (default: 20)
+- `--batch-size <N>` - Maximum tests per slang-test invocation (default: 100)
+- `--batch-duration <SECS>` - Target batch duration in seconds when timing data is available (default: 10.0)
 - `--retries <N>` - Number of retries for failed tests (default: 2)
 - `--hide-ignored` - Hide ignored tests from output
 - `--ignore <PATTERN>` - Ignore tests matching pattern (can be specified multiple times)
 - `--diff <TOOL>` - Diff tool for showing expected/actual differences: `none`, `diff`, `difft` (default: `diff`)
-- `--machine-output` - Machine-readable output: no carriage returns, no terminal clearing, sparse progress updates (every 100 tests)
 - `-v, --verbose` - Verbose output: show batch reproduction commands for slow batches, extended slow-test report with per-backend timing
+- `--no-timing-cache` - Ignore cached timing data for scheduling and ETA
+- `--adaptive` - Adaptive load balancing: spawn extra workers when CPU is underutilized
+- `--event-log <PATH>` - Write CSV event log for performance debugging
 - `-- <ARGS>` - Additional arguments to pass directly to slang-test
+
+When stderr is not a TTY (e.g., in CI or when piped), output automatically switches to machine-readable format: no carriage returns, no terminal clearing, sparse progress updates.
 
 ## Output format
 
@@ -153,13 +159,14 @@ Exit codes:
 
 ## Core Module Compilation
 
-On debug builds of slang, the first invocation of slang-test compiles the core module which can take 10-20 seconds. To avoid having all parallel workers trying to compile simultaneously, the runner executes the first batch before starting workers:
+On debug builds of slang, the first invocation of slang-test compiles the core module which can take 10-20 seconds. The runner handles this automatically:
 
-1. Runs first batch of tests
-2. If "Compiling" message is detected on stderr, displays it and waits for completion
-3. Once first batch completes, starts parallel workers for remaining batches
+1. All workers start immediately for maximum parallelism
+2. When "Compiling core module" is detected on stderr, the runner tracks which batch is compiling
+3. Other batches that aren't doing the compilation are killed and their files re-queued
+4. Once compilation completes, all workers resume normal execution
 
-This ensures the core module is cached before parallel execution begins, without wasting a separate warmup run.
+This ensures only one process compiles the core module while minimizing wasted work.
 
 ## Ctrl-C Handling
 
@@ -174,15 +181,15 @@ Pressing Ctrl-C gracefully interrupts the test run:
 
 Instead of pre-creating batches, the runner uses a dynamic work pool that workers pull from:
 
-1. **Adaptive batch sizing**: Batch size depends on remaining work:
-   - Many files remaining: full batch size (e.g., 20 files)
-   - Getting low: half size
-   - Nearly done: quarter size
-   - Final stretch: single files for maximum parallelism
+1. **Duration-based batching**: When timing data is available, batches target a duration (default 10s via `--batch-duration`) rather than a fixed file count. This balances startup overhead against batch size. Without timing data, random batches up to `--batch-size` are used.
 
-2. **Retry integration**: Failed tests go back into the same pool, automatically getting picked up by available workers
+2. **Slow-first scheduling**: Files are sorted by predicted duration (longest first) and workers preferentially pick slower files. This prevents the "long tail" problem where one worker is stuck on slow tests at the end.
 
-3. **Progress display**: Shows `[running/queued]` so you can see parallelism level:
+3. **End-game single files**: When few files remain (less than 2× worker count), files are dispatched individually for maximum parallelism.
+
+4. **Retry integration**: Failed tests go back into the same pool, automatically getting picked up by available workers.
+
+5. **Progress display**: Shows `[running/queued]` so you can see parallelism level:
    - `[32/100]` = 32 batches running, 100 files still in queue
    - `[8/0]` = 8 batches running, queue empty (finishing up)
 
@@ -194,7 +201,7 @@ The runner maintains a cache of test execution times to optimize scheduling:
 
 1. **Per-test timing**: During execution, the runner tracks how long each test takes, broken down by backend (vk, cpu, llvm, etc.)
 
-2. **Cache storage**: After each run, timing data is saved to `~/.cache/slang-test-runner/timing.json`
+2. **Cache storage**: After each run, timing data is saved to the state directory (see below)
 
 3. **LPT scheduling**: On subsequent runs, files are sorted by predicted duration (longest first). This ensures slow tests start early and run concurrently with faster tests, preventing the "long tail" problem where all workers finish except one stuck on slow tests.
 
@@ -218,7 +225,7 @@ There might be several tests per test file, some of which are synthesized and so
 
 There are also internal tests not represented by files, these are called `slang-unit-test-tool/modulePtr.internal` or similar.
 
-Tests might be in .slang files, or .hlsl or .glsl files in the tests directory.
+Tests might be in .slang, .hlsl, .glsl, or .c files in the tests directory.
 
 See `slang-test -h` for the full list of options.
 
