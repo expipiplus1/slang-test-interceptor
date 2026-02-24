@@ -25,8 +25,6 @@
         slang-test-runner = craneLibNative.buildPackage {
           src = craneLibNative.cleanCargoSource ./.;
           strictDeps = true;
-          buildInputs = [ ];
-          nativeBuildInputs = [ ];
         };
 
         # Helper for static Linux musl builds
@@ -91,35 +89,11 @@
             doCheck = false;
           };
 
-        # Helper for aarch64 Windows builds (using LLVM)
-        mkWindowsAarch64Package =
-          let
-            pkgs = import nixpkgs {
-              system = localSystem;
-              overlays = [ (import rust-overlay) ];
-            };
+        # Note: aarch64-windows cross-compilation is not supported due to missing
+        # Windows import libraries (kernel32, etc.) in nixpkgs for ARM64.
 
-            craneLib = (crane.mkLib pkgs).overrideToolchain (p:
-              p.rust-bin.stable.latest.default.override {
-                targets = [ "aarch64-pc-windows-gnullvm" ];
-              }
-            );
-          in
-          craneLib.buildPackage {
-            src = craneLib.cleanCargoSource ./.;
-            strictDeps = true;
-
-            CARGO_BUILD_TARGET = "aarch64-pc-windows-gnullvm";
-            CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
-
-            # Use lld as the linker for LLVM-based target
-            CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER = "${pkgs.llvmPackages.clang}/bin/clang";
-
-            nativeBuildInputs = [ pkgs.llvmPackages.clang pkgs.llvmPackages.lld ];
-            depsBuildBuild = [ pkgs.stdenv.cc ];
-
-            doCheck = false;
-          };
+        # Note: macOS cross-compilation from Linux is not supported by vanilla nixpkgs
+        # (Apple's cctools/ld64 are only available on macOS). Build on macOS directly.
 
         # Linux static builds
         slang-test-runner-x86_64-linux = mkStaticMuslPackage {
@@ -132,22 +106,19 @@
           linkerEnv = "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER";
         };
 
-        # Windows builds
+        # Windows build
         slang-test-runner-x86_64-windows = mkWindowsX86_64Package;
-        slang-test-runner-aarch64-windows = mkWindowsAarch64Package;
       in
       {
         packages = {
           default = slang-test-runner;
-          slang-test-runner = slang-test-runner;
 
-          # Static Linux binaries
+          # Cross-compiled static Linux binaries (no external dependencies)
           x86_64-linux-static = slang-test-runner-x86_64-linux;
           aarch64-linux-static = slang-test-runner-aarch64-linux;
 
-          # Windows binaries
+          # Cross-compiled Windows binary
           x86_64-windows = slang-test-runner-x86_64-windows;
-          aarch64-windows = slang-test-runner-aarch64-windows;
         };
 
         apps.default = {
