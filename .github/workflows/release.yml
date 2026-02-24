@@ -62,17 +62,19 @@ jobs:
         if: ${{ !matrix.cross }}
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Rename artifact
+      - name: Package artifact
         shell: bash
         run: |
-          mkdir -p artifacts
-          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} artifacts/sti-${{ matrix.target }}${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
+          cd staging
+          zip ../sti-${{ matrix.target }}.zip ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: sti-${{ matrix.target }}
-          path: artifacts/
+          path: sti-${{ matrix.target }}.zip
 
   nix:
     runs-on: ubuntu-latest
