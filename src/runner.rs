@@ -401,6 +401,7 @@ pub fn run_batch_with_pool(
 
     let mut cmd = Command::new(ctx.slang_test);
     cmd.arg("-explicit-test-order")
+        .arg("-disable-retries")
         .args(ctx.test_files)
         .args(ctx.extra_args)
         .stdout(Stdio::piped())
