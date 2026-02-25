@@ -84,15 +84,15 @@ fn calculate_initial_eta(
 /// Format the "Running N tests with M workers" message.
 fn format_running_message(num_tests: usize, num_workers: usize, predicted_eta: Option<f64>, api_ignored: usize) -> String {
     let ignored_part = if api_ignored > 0 {
-        format!(" {}", format!("(ignored {} tests on unsupported APIs)", api_ignored).dimmed())
+        format!(" {}", format!("(ignoring {} tests on unsupported APIs)", api_ignored).dimmed())
     } else {
         String::new()
     };
 
     match predicted_eta {
         Some(eta) => format!(
-            "Running {} tests with {} workers {}{}",
-            num_tests, num_workers, format!("(predicted {:.0}s)", eta).dimmed(), ignored_part
+            "Running {} tests with {} workers{} {}",
+            num_tests, num_workers, ignored_part, format!("(predicted ETA {:.0}s)", eta).dimmed()
         ),
         None => format!(
             "Running {} tests with {} workers{}",
@@ -1312,7 +1312,7 @@ impl TestRunner {
                 pb.finish_and_clear();
             }
             let msg = if api_ignored > 0 {
-                format!("No tests found matching the specified criteria (ignored {} tests on unsupported APIs)", api_ignored)
+                format!("No tests found matching the specified criteria (ignoring {} tests on unsupported APIs)", api_ignored)
             } else {
                 "No tests found matching the specified criteria".to_string()
             };
@@ -1326,7 +1326,7 @@ impl TestRunner {
                 println!("{}", test);
             }
             let ignored_msg = if api_ignored > 0 {
-                format!(" (ignored {} tests on unsupported APIs)", api_ignored)
+                format!(" (ignoring {} tests on unsupported APIs)", api_ignored)
             } else {
                 String::new()
             };

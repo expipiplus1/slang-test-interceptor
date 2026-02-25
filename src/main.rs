@@ -543,7 +543,7 @@ fn main() -> Result<()> {
         }
 
         let ignored_msg = if api_ignored > 0 {
-            format!(" (ignored {} tests on unsupported APIs)", api_ignored)
+            format!(" (ignoring {} tests on unsupported APIs)", api_ignored)
         } else {
             String::new()
         };

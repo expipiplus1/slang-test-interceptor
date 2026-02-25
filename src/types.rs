@@ -1494,7 +1494,10 @@ pub struct ProgressDisplay {
     total_files: usize,
     start_time: Instant,
     machine_output: bool,
-    last_reported_files: AtomicUsize,
+    /// For machine output: last report time in milliseconds since start
+    last_report_time_ms: AtomicUsize,
+    /// For machine output: tracks if we've reported 0% and 99%
+    reported_milestones: AtomicUsize, // bit 0 = 0%, bit 1 = 99%
     /// MultiProgress container - must be kept alive for progress bars to render correctly
     #[allow(dead_code)]
     multi_progress: Option<MultiProgress>,
@@ -1554,7 +1557,8 @@ impl ProgressDisplay {
             total_files,
             start_time: Instant::now(),
             machine_output,
-            last_reported_files: AtomicUsize::new(0),
+            last_report_time_ms: AtomicUsize::new(0),
+            reported_milestones: AtomicUsize::new(0),
             multi_progress,
             main_progress_bar,
             worker_bars,
@@ -1589,32 +1593,42 @@ impl ProgressDisplay {
         let elapsed = self.start_time.elapsed().as_secs_f64();
 
         if self.machine_output {
-            // Report at 0%, 10%, 20%, ... 90%, 99%, 100%
-            // last_reported_files stores (last_pct + 1) so 0 means "haven't reported yet"
-            // We use 0-10 for 0%-100% in 10% steps, and 99 as a special marker for 99%
-            let current_pct = (tests_done * 10) / self.total_files.max(1);
-            let at_99_pct = tests_done * 100 >= self.total_files * 99 && tests_done < self.total_files;
-            let last_reported = self.last_reported_files.load(Ordering::SeqCst);
-            let should_report = if last_reported == 0 {
+            // Report at 0%, every 3 seconds, and at 99%
+            let elapsed_ms = (elapsed * 1000.0) as usize;
+            let last_report_ms = self.last_report_time_ms.load(Ordering::SeqCst);
+            let milestones = self.reported_milestones.load(Ordering::SeqCst);
+            let reported_0 = milestones & 1 != 0;
+            let reported_99 = milestones & 2 != 0;
+
+            let percent = (tests_done as f64 / self.total_files.max(1) as f64) * 100.0;
+            let at_99_pct = percent >= 99.0 && tests_done < self.total_files;
+
+            let should_report = if !reported_0 {
                 true  // First report (0%)
-            } else if at_99_pct && last_reported < 99 {
+            } else if at_99_pct && !reported_99 {
                 true  // Report at 99%
             } else {
-                current_pct >= last_reported && last_reported <= 10  // Next 10% threshold
+                elapsed_ms >= last_report_ms + 3000  // Every 3 seconds
             };
+
             if should_report {
-                let new_marker = if at_99_pct { 99 } else { current_pct + 1 };
-                self.last_reported_files.store(new_marker, Ordering::SeqCst);
-                let percent = (tests_done as f64 / self.total_files.max(1) as f64) * 100.0;
+                self.last_report_time_ms.store(elapsed_ms, Ordering::SeqCst);
+                let new_milestones = milestones | 1 | if at_99_pct { 2 } else { 0 };
+                self.reported_milestones.store(new_milestones, Ordering::SeqCst);
+
+                // Calculate column widths based on total_files
+                let count_width = self.total_files.max(1).to_string().len();
+
                 let eta = match adjusted_eta {
-                    Some(secs) if secs > 1.0 => format!(" \x1b[2m|\x1b[0m ETA: {:.1}s", secs),
-                    Some(_) => " \x1b[2m|\x1b[0m ETA: <1s".to_string(),
+                    Some(secs) if secs > 1.0 => format!(" \x1b[2m|\x1b[0m ETA: {:>6.1}s", secs),
+                    Some(_) => " \x1b[2m|\x1b[0m ETA:    <1s".to_string(),
                     None => String::new(),
                 };
                 eprintln!(
-                    "[{}/{}/{}] {:.1}% \x1b[2m|\x1b[0m {} passed, {} failed, {} ignored \x1b[2m|\x1b[0m Elapsed: {:.1}s{}",
+                    "[{:>2}/{:>w$}/{:>w$}] {:>5.1}% \x1b[2m|\x1b[0m {:>w$} passed, {:>w$} failed, {:>w$} ignored \x1b[2m|\x1b[0m Elapsed: {:>6.1}s{}",
                     batches_running, tests_remaining, self.total_files,
-                    percent, passed, failed, ignored, elapsed, eta
+                    percent, passed, failed, ignored, elapsed, eta,
+                    w = count_width
                 );
             }
         } else if let Some(ref pb) = self.main_progress_bar {
@@ -1708,9 +1722,11 @@ impl ProgressDisplay {
             let failed = stats.failed.load(Ordering::SeqCst);
             let ignored = stats.ignored.load(Ordering::SeqCst);
             let elapsed = self.start_time.elapsed().as_secs_f64();
+            let count_width = self.total_files.max(1).to_string().len();
             eprintln!(
-                "[0/0/{}] 100.0% \x1b[2m|\x1b[0m {} passed, {} failed, {} ignored \x1b[2m|\x1b[0m Elapsed: {:.1}s \x1b[2m|\x1b[0m",
-                self.total_files, passed, failed, ignored, elapsed
+                "[ 0/{:>w$}/{:>w$}] 100.0% \x1b[2m|\x1b[0m {:>w$} passed, {:>w$} failed, {:>w$} ignored \x1b[2m|\x1b[0m Elapsed: {:>6.1}s \x1b[2m|\x1b[0m",
+                0, self.total_files, passed, failed, ignored, elapsed,
+                w = count_width
             );
         }
     }

@@ -44,8 +44,11 @@ sti --ignore 'compute'
 sti --api vk
 sti --ignore-api cuda
 
-# Limit concurrent GPU tests (useful when GPU memory is limited)
+# Limit concurrent GPU tests
 sti -g 4
+
+# Run only CPU tests (skip all GPU tests)
+sti -g 0
 ```
 
 ## Options
@@ -55,13 +58,13 @@ sti -g 4
 - `<FILTERS>` - Regex patterns to filter tests (union: test runs if it matches ANY filter). Examples: `diagnostic` (infix), `^tests/compute` (prefix), `\.slang$` (suffix). If empty, runs all tests.
 - `-C, --root-dir <PATH>` - Root directory of the slang project (default: current directory)
 - `-j, --jobs <N>` - Number of parallel workers (default: number of CPUs)
-- `-g, --gpu-jobs <N>` - Maximum concurrent GPU batches (vk/cuda/dx11/dx12/metal and gfx-unit-test-tool tests). When set, tests are segmented into GPU-only and CPU-only batches, and at most N GPU batches run concurrently. Useful when GPU memory is limited.
+- `-g, --gpu-jobs <N>` - Maximum concurrent GPU batches (vk/cuda/dx11/dx12/metal and gfx-unit-test-tool tests). When set, tests are segmented into GPU-only and CPU-only batches, and at most N GPU batches run concurrently. Use `-g 0` to skip all GPU tests entirely (CPU-only mode).
 - `--dry-run` - List tests that would be run without actually running them
 - `--ignore <PATTERN>` - Ignore tests matching regex pattern (can be specified multiple times; union: ignored if matches ANY)
 - `--api <API>` - Only run tests for specific APIs (can be specified multiple times; union: runs if matches ANY). Examples: `--api vk --api cuda`
 - `--ignore-api <API>` - Exclude tests for specific APIs (can be specified multiple times; union: excluded if matches ANY). Examples: `--ignore-api metal`
 - `--diff <TOOL>` - Diff tool for expected/actual differences: `none`, `diff`, `difft` (default: `diff`)
-- `-v, --verbose` - Verbose output: show per-worker progress (which test each worker is running), batch reproduction commands for slow batches, extended slow-test report with per-backend timing
+- `-v, --verbose` - Verbose output: show per-worker progress (which test each worker is running), CPU/GPU load, batch reproduction commands for slow batches, slowest tests report, and batch size histogram
 - `-- <ARGS>` - Additional arguments to pass directly to slang-test (e.g., `-- -api vk`)
 
 ### Build selection
@@ -73,7 +76,7 @@ sti -g 4
 
 - `--retries <N>` - Number of retries for failed tests (default: 2).
 - `--hide-ignored` - Hide ignored tests from output
-- `--batch-size <N>` - Maximum tests per slang-test invocation (default: auto-calculated as `(num_tests/jobs)*3`)
+- `--batch-size <N>` - Maximum tests per slang-test invocation (default: auto-calculated as `(num_tests/jobs)*2` with timing data, or `min(50, num_tests/jobs)` without)
 - `--batch-duration <SECS>` - Target batch duration in seconds when timing data is available (default: auto-calculated as `predicted_runtime/2`, minimum 1.0)
 - `--no-timing-cache` - Ignore cached timing data for scheduling and ETA
 - `--no-early-api-check` - Disable early API detection (see Early API Detection section below)
@@ -105,7 +108,7 @@ At completion, a summary shows:
 
 - Failed tests with details and diff output
 - Overall statistics
-- Slowest files (if timing data available)
+- Slowest tests and batch histogram (verbose mode only)
 - Command to rerun failures
 
 ## Crash/Segfault Handling
@@ -209,8 +212,9 @@ Before discovering tests, the runner performs a quick check to determine which g
 
 Some APIs are known to be unavailable on certain platforms:
 
-- **Linux/macOS**: Metal (`mtl`, `metal`) and WGPU (`wgpu`) are marked unsupported
-- **macOS**: DirectX (`dx11`, `dx12`, `d3d11`, `d3d12`) is marked unsupported
+- **Linux**: Metal (`mtl`, `metal`) and WGPU (`wgpu`) are marked unsupported
+- **macOS**: DirectX (`dx11`, `dx12`, `d3d11`, `d3d12`) and WGPU (`wgpu`) are marked unsupported
+- **Windows**: Metal (`mtl`, `metal`) is marked unsupported
 - **All platforms**: CPU (`cpu`) is always marked as supported
 
 ### Output
