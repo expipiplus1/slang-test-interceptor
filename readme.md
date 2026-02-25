@@ -57,7 +57,7 @@ sti --ignore-api cuda
 - `--api <API>` - Only run tests for specific APIs (can be specified multiple times; union: runs if matches ANY). Examples: `--api vk --api cuda`
 - `--ignore-api <API>` - Exclude tests for specific APIs (can be specified multiple times; union: excluded if matches ANY). Examples: `--ignore-api metal`
 - `--diff <TOOL>` - Diff tool for expected/actual differences: `none`, `diff`, `difft` (default: `diff`)
-- `-v, --verbose` - Verbose output: show batch reproduction commands for slow batches, extended slow-test report with per-backend timing
+- `-v, --verbose` - Verbose output: show per-worker progress (which test each worker is running), batch reproduction commands for slow batches, extended slow-test report with per-backend timing
 - `-- <ARGS>` - Additional arguments to pass directly to slang-test (e.g., `-- -api vk`)
 
 ### Build selection
@@ -69,10 +69,9 @@ sti --ignore-api cuda
 
 - `--retries <N>` - Number of retries for failed tests (default: 2).
 - `--hide-ignored` - Hide ignored tests from output
-- `--batch-size <N>` - Maximum tests per slang-test invocation (default: 300)
+- `--batch-size <N>` - Maximum tests per slang-test invocation (default: 100)
 - `--batch-duration <SECS>` - Target batch duration in seconds when timing data is available (default: 10.0)
 - `--no-timing-cache` - Ignore cached timing data for scheduling and ETA
-- `--adaptive` - Adaptive load balancing: spawn extra workers when CPU is underutilized
 - `--event-log <PATH>` - Write CSV event log for performance debugging
 - `--timeout <SECS>` - Timeout per test batch in seconds (default: 600 = 10 minutes)
 

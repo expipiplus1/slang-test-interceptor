@@ -5,13 +5,13 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::types::{*, TestId, test_to_timing_key};
+use crate::types::{*, TestId, test_to_timing_key, WorkerState, WorkerStates, WorkerStatus};
 
 // ============================================================================
 // Debug Logging
@@ -399,6 +399,7 @@ pub fn run_batch_with_pool(
     running: &AtomicUsize,
     machine_output: bool,
     verbose: bool,
+    worker_state: Option<&WorkerState>,
 ) {
     let ctx = BatchContext {
         slang_test,
@@ -415,6 +416,11 @@ pub fn run_batch_with_pool(
         machine_output,
         verbose,
     };
+
+    // Track current test for progress display
+    if let Some(state) = worker_state {
+        state.start_batch(test_files);
+    }
 
     ctx.running.fetch_add(1, Ordering::SeqCst);
     let batch_start = Instant::now();
@@ -472,14 +478,30 @@ pub fn run_batch_with_pool(
         .map(|f| TestId::parse(f).to_slang_test_arg())
         .collect();
 
+    // Create a shared pipe for stdout and stderr so we get ordered output
+    let (pipe_reader, pipe_writer) = match os_pipe::pipe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ERROR: Failed to create pipe: {}", e);
+            return;
+        }
+    };
+    let pipe_writer2 = match pipe_writer.try_clone() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ERROR: Failed to clone pipe: {}", e);
+            return;
+        }
+    };
+
     let mut cmd = Command::new(ctx.slang_test);
     cmd.current_dir(ctx.root_dir)
         .arg("-explicit-test-order")
         .arg("-disable-retries")
         .args(&slang_test_args)
         .args(ctx.extra_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(pipe_writer)
+        .stderr(pipe_writer2);
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -489,20 +511,17 @@ pub fn run_batch_with_pool(
         }
     };
 
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-
     let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded::<TestOutcome>();
     let (stderr_tx, stderr_rx) = crossbeam_channel::unbounded::<String>();
     let (timing_tx, timing_rx) = crossbeam_channel::unbounded::<(String, f64)>(); // (test_id, duration)
     let (done_tx, done_rx) = crossbeam_channel::bounded::<bool>(1); // Signal when output is complete
+    let (compiling_tx, compiling_rx) = crossbeam_channel::unbounded::<bool>();
 
     let machine_output_for_stderr = ctx.machine_output;
 
-    let stdout_handle = thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        let mut seen_tests: HashSet<String> = HashSet::new();
-        let mut saw_summary = false;
+    // Single reader thread for combined stdout/stderr
+    let output_handle = thread::spawn(move || {
+        let reader = BufReader::new(pipe_reader);
 
         let mut last_test_time: Option<Instant> = None;
 
@@ -513,9 +532,21 @@ pub fn run_batch_with_pool(
             if let Ok(line) = line {
                 // Detect the summary line that indicates normal completion
                 if line.starts_with("===") || line.contains("% of tests") || line == "no tests run" {
-                    saw_summary = true;
                     // Signal early that we're done - don't wait for process exit
                     let _ = done_tx.try_send(true);
+                    continue;
+                }
+
+                // Handle "Compiling" messages (originally from stderr)
+                if line.contains("Compiling core module") {
+                    set_compiling_core(true);
+                    let _ = compiling_tx.send(true);
+                    if machine_output_for_stderr {
+                        eprintln!("{}", format!("INFO: {}", line).dimmed());
+                    }
+                    continue;
+                } else if line.contains("Compiling") {
+                    let _ = compiling_tx.send(true);
                     continue;
                 }
 
@@ -527,6 +558,7 @@ pub fn run_batch_with_pool(
                     continue;
                 }
 
+                // Try to parse as test output
                 if let Some(mut outcome) = parse_test_output(&line) {
                     let now = Instant::now();
 
@@ -555,31 +587,11 @@ pub fn run_batch_with_pool(
                         let _ = timing_tx.send((timing_key.clone(), test_duration));
                     }
 
-                    seen_tests.insert(timing_key);
-
                     let _ = outcome_tx.send(outcome);
+                } else {
+                    // Not a test result - must be stderr output (error details, etc.)
+                    let _ = stderr_tx.send(line);
                 }
-            }
-        }
-
-        (seen_tests, saw_summary)
-    });
-
-    let (compiling_tx, compiling_rx) = crossbeam_channel::unbounded::<bool>();
-    let stderr_handle = thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                if line.contains("Compiling core module") {
-                    set_compiling_core(true);
-                    let _ = compiling_tx.send(true);
-                    if machine_output_for_stderr {
-                        eprintln!("{}", format!("INFO: {}", line).dimmed());
-                    }
-                } else if line.contains("Compiling") {
-                    let _ = compiling_tx.send(true);
-                }
-                let _ = stderr_tx.send(line);
             }
         }
         let _ = compiling_tx.send(false);
@@ -591,6 +603,8 @@ pub fn run_batch_with_pool(
     let mut killed_for_compilation = false;
     let mut killed_for_timeout = false;
     let mut exit_status: Option<std::process::ExitStatus> = None;
+    let mut seen_tests: HashSet<String> = HashSet::new();
+    let expected_test_count = ctx.test_files.len();
 
     loop {
         if is_interrupted() {
@@ -632,7 +646,23 @@ pub fn run_batch_with_pool(
             test_count.fetch_add(1, Ordering::SeqCst);
             log_event("test", &format!("{:?} {} {} duration_ms={}", batch_id, result_str, outcome.name, duration_ms));
 
+            // Track seen tests for crash detection
+            let test_id = TestId::parse(&outcome.name);
+            seen_tests.insert(test_id.to_timing_key());
+
             process_outcome(outcome, &ctx, &mut failed_outcomes);
+
+            // Advance to next test in batch for progress display
+            if let Some(state) = worker_state {
+                state.advance();
+            }
+        }
+
+        // Check if we've seen all expected tests - no need to wait for slang-test
+        // With shared stdout/stderr pipe, failure output comes before next test result
+        if seen_tests.len() >= expected_test_count {
+            reap_process(child);
+            break;
         }
 
         // Check if output is complete (saw summary or "no tests run")
@@ -683,6 +713,10 @@ pub fn run_batch_with_pool(
     }
 
     if killed_for_compilation {
+        // Clear worker state before returning
+        if let Some(state) = worker_state {
+            state.clear();
+        }
         for file in ctx.test_files {
             ctx.work_pool.add_file(file.to_string());
         }
@@ -692,21 +726,9 @@ pub fn run_batch_with_pool(
         return;
     }
 
-    let join_start = Instant::now();
-    let (seen_tests, saw_summary) = stdout_handle.join().unwrap_or_default();
-    let stdout_join_time = join_start.elapsed();
-
-    let stderr_join_start = Instant::now();
-    stderr_handle.join().ok();
-    let stderr_join_time = stderr_join_start.elapsed();
-
-    if stdout_join_time.as_secs() > 5 || stderr_join_time.as_secs() > 5 {
-        eprintln!("{}", format!("\nWARNING: Slow thread joins - stdout: {:.1}s, stderr: {:.1}s for {:?}",
-            stdout_join_time.as_secs_f64(),
-            stderr_join_time.as_secs_f64(),
-            ctx.test_files
-        ).dimmed());
-    }
+    // Don't join output thread - it'll finish on its own
+    // We already have all the data we need via channels
+    drop(output_handle);
 
     let stderr_lines: Vec<String> = stderr_rx.try_iter().collect();
 
@@ -731,8 +753,9 @@ pub fn run_batch_with_pool(
         }
     }
 
-    // Detect crash or timeout: if we didn't see the summary and weren't interrupted/killed for compilation
-    if !saw_summary && !is_interrupted() && !killed_for_compilation {
+    // Detect crash or timeout: if we didn't see all tests and weren't interrupted/killed for compilation
+    let all_tests_seen = seen_tests.len() >= expected_test_count;
+    if !all_tests_seen && !is_interrupted() && !killed_for_compilation {
         let exit_info = if killed_for_timeout {
             format!("timeout after {}s", ctx.timeout.as_secs())
         } else {
@@ -799,6 +822,11 @@ pub fn run_batch_with_pool(
     for outcome in failed_outcomes {
         let info = parse_failure_info(&outcome.name, &outcome.failure_output);
         ctx.failures.lock().unwrap().push(info);
+    }
+
+    // Clear worker state at end of batch
+    if let Some(state) = worker_state {
+        state.clear();
     }
 }
 
@@ -1103,6 +1131,13 @@ impl TestRunner {
 
         let timeout = Duration::from_secs(self.args.timeout);
 
+        // Create worker states for per-worker progress display (TTY mode only)
+        let worker_states = if !self.machine_output {
+            Some(Arc::new(WorkerStates::new(self.args.jobs)))
+        } else {
+            None
+        };
+
         // Mark execution started so progress display can show "waiting for output"
         stats.mark_execution_started();
 
@@ -1117,8 +1152,10 @@ impl TestRunner {
         let total_files = test_files.len();
         let machine_output = self.machine_output;
         let num_workers = self.args.jobs;
+        let progress_worker_states = worker_states.clone();
+        let verbose_for_progress = self.args.verbose;
         let progress_handle = thread::spawn(move || {
-            let display = ProgressDisplay::new(total_files, machine_output);
+            let mut display = ProgressDisplay::new(total_files, machine_output, num_workers, verbose_for_progress);
             // Initialize SystemStats lazily to avoid blocking the first progress update
             let mut sys_stats: Option<SystemStats> = None;
             let mut stats_counter = 0u32;
@@ -1126,12 +1163,13 @@ impl TestRunner {
                 let files_done = progress_stats.files_completed();
                 let batches_running = progress_running.load(Ordering::SeqCst);
                 let batches_remaining = progress_pool.remaining();
+                let has_pending_batches = progress_pool.has_pending_batches();
                 let eta = if progress_pool.has_timing_data {
                     Some(progress_pool.calculate_eta(num_workers))
                 } else {
                     None
                 };
-                display.update(&progress_stats, files_done, batches_running, batches_remaining, eta);
+                display.update(&progress_stats, files_done, batches_running, batches_remaining, has_pending_batches, eta, progress_worker_states.as_deref());
 
                 stats_counter += 1;
                 if stats_counter >= 10 {
@@ -1140,7 +1178,7 @@ impl TestRunner {
                     sys.refresh_and_log(batches_running, batches_remaining);
                 }
 
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(16));
             }
             display.finish(&progress_stats);
         });
@@ -1162,15 +1200,20 @@ impl TestRunner {
                 let shutdown = shutdown.clone();
                 let machine_output = self.machine_output;
                 let verbose = self.args.verbose;
+                let worker_states_clone = worker_states.clone();
 
                 let worker_id = i;
                 let handle = thread::spawn(move || {
                     debug_log!("worker {} started, getting first batch", worker_id);
+                    let my_state = worker_states_clone.as_ref().map(|ws| ws.get(worker_id));
                     loop {
                         if shutdown.load(Ordering::SeqCst) || is_interrupted() {
                             break;
                         }
 
+                        if let Some(state) = my_state {
+                            state.set_status(WorkerStatus::FetchingBatch);
+                        }
                         let get_batch_start = Instant::now();
                         if let Some((batch_id, batch)) = pool.try_get_batch() {
                             let get_batch_time = get_batch_start.elapsed();
@@ -1192,9 +1235,13 @@ impl TestRunner {
                                 &running,
                                 machine_output,
                                 verbose,
+                                my_state,
                             );
                             pool.complete_batch(batch_id);
                         } else {
+                            if let Some(state) = my_state {
+                                state.set_status(WorkerStatus::Idle);
+                            }
                             thread::sleep(Duration::from_millis(10));
                         }
                     }
@@ -1213,11 +1260,11 @@ impl TestRunner {
 
             shutdown.store(true, Ordering::SeqCst);
 
-            for handle in handles {
-                handle.join().unwrap();
-            }
+            // Don't wait for workers - they'll exit on their own when they see shutdown
+            drop(handles);
 
             progress_shutdown.store(true, Ordering::SeqCst);
+            // Must join progress thread to ensure it stops writing before we print failures
             let _ = progress_handle.join();
         }
 

@@ -38,7 +38,7 @@ pub struct Args {
     pub jobs: usize,
 
     /// Maximum files per batch (with timing data, batches target ~10s duration up to this limit)
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 100)]
     pub batch_size: usize,
 
     /// Target batch duration in seconds (only used with timing cache)
@@ -175,51 +175,14 @@ pub fn discover_tests_streaming(
     // Log the dry-run invocation
     log_event("dry_run", &format!("{} -dry-run -skip-api-detection", slang_test.display()));
 
-    // Try to use stdbuf to force line-buffering (avoids delay waiting for "no tests run")
-    // Falls back to running slang-test directly if stdbuf isn't available
-    let (mut child, using_stdbuf) = {
-        #[cfg(unix)]
-        {
-            let stdbuf_result = Command::new("stdbuf")
-                .arg("-oL")
-                .arg(slang_test)
-                .arg("-dry-run")
-                .arg("-skip-api-detection")
-                .current_dir(root_dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
-
-            match stdbuf_result {
-                Ok(child) => (child, true),
-                Err(_) => {
-                    // stdbuf not available, fall back to direct execution
-                    let child = Command::new(slang_test)
-                        .arg("-dry-run")
-                        .arg("-skip-api-detection")
-                        .current_dir(root_dir)
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .with_context(|| format!("Failed to run {} -dry-run", slang_test.display()))?;
-                    (child, false)
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let child = Command::new(slang_test)
-                .arg("-dry-run")
-                .arg("-skip-api-detection")
-                .current_dir(root_dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .with_context(|| format!("Failed to run {} -dry-run", slang_test.display()))?;
-            (child, false)
-        }
-    };
-    let _ = using_stdbuf; // suppress unused warning
+    let mut child = Command::new(slang_test)
+        .arg("-dry-run")
+        .arg("-skip-api-detection")
+        .current_dir(root_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to run {} -dry-run", slang_test.display()))?;
 
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();

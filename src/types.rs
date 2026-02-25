@@ -1,4 +1,4 @@
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use sysinfo::{CpuRefreshKind, RefreshKind, System};
 use std::collections::{HashMap, HashSet};
@@ -629,6 +629,12 @@ impl WorkPool {
             && self.in_flight.lock().unwrap().is_empty()
     }
 
+    /// Check if there are batches waiting to be picked up (excluding in-flight)
+    pub fn has_pending_batches(&self) -> bool {
+        !self.batches.lock().unwrap().is_empty()
+            || !self.pending_files.lock().unwrap().is_empty()
+    }
+
     /// Returns number of tests remaining (in pool + in-flight)
     pub fn remaining(&self) -> usize {
         let batches = self.batches.lock().unwrap();
@@ -726,6 +732,130 @@ impl WorkPool {
 }
 
 // ============================================================================
+// Worker State (for per-worker progress display)
+// ============================================================================
+
+/// Sentinel value meaning "no test running" (worker is idle or between batches)
+pub const WORKER_IDLE: usize = usize::MAX;
+
+/// What a worker is currently doing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerStatus {
+    /// Sleeping between batches
+    Idle,
+    /// Trying to get a batch from the pool
+    FetchingBatch,
+    /// Launching slang-test process
+    Starting,
+    /// Running tests (index into current batch)
+    Running,
+    /// Finishing batch (joining threads, handling results)
+    Finishing,
+}
+
+impl std::fmt::Display for WorkerStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerStatus::Idle => write!(f, "idle"),
+            WorkerStatus::FetchingBatch => write!(f, "fetching batch"),
+            WorkerStatus::Starting => write!(f, "starting"),
+            WorkerStatus::Running => write!(f, "running"),
+            WorkerStatus::Finishing => write!(f, "finishing"),
+        }
+    }
+}
+
+/// State for a single worker, used to track what test is currently running.
+/// The worker writes to this, and the progress thread reads from it.
+pub struct WorkerState {
+    /// Index into the current batch's test list. WORKER_IDLE means not running.
+    pub current_test_idx: AtomicUsize,
+    /// The current batch of tests (set when batch starts, cleared when batch ends)
+    pub current_batch: Mutex<Vec<String>>,
+    /// Current status of the worker
+    pub status: AtomicUsize,
+}
+
+impl WorkerState {
+    pub fn new() -> Self {
+        Self {
+            current_test_idx: AtomicUsize::new(WORKER_IDLE),
+            current_batch: Mutex::new(Vec::new()),
+            status: AtomicUsize::new(WorkerStatus::Idle as usize),
+        }
+    }
+
+    /// Set the worker's status
+    pub fn set_status(&self, status: WorkerStatus) {
+        self.status.store(status as usize, Ordering::SeqCst);
+    }
+
+    /// Get the worker's current status
+    pub fn get_status(&self) -> WorkerStatus {
+        match self.status.load(Ordering::SeqCst) {
+            0 => WorkerStatus::Idle,
+            1 => WorkerStatus::FetchingBatch,
+            2 => WorkerStatus::Starting,
+            3 => WorkerStatus::Running,
+            4 => WorkerStatus::Finishing,
+            _ => WorkerStatus::Idle,
+        }
+    }
+
+    /// Called when a worker starts a new batch
+    pub fn start_batch(&self, batch: &[String]) {
+        *self.current_batch.lock().unwrap() = batch.to_vec();
+        self.current_test_idx.store(0, Ordering::SeqCst);
+        self.set_status(WorkerStatus::Running);
+    }
+
+    /// Called when a test completes - advance to next test
+    pub fn advance(&self) {
+        self.current_test_idx.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Called when batch completes or worker goes idle
+    pub fn clear(&self) {
+        self.current_test_idx.store(WORKER_IDLE, Ordering::SeqCst);
+        self.current_batch.lock().unwrap().clear();
+        self.set_status(WorkerStatus::Idle);
+    }
+
+    /// Get the currently running test name, if any
+    pub fn current_test(&self) -> Option<String> {
+        let idx = self.current_test_idx.load(Ordering::SeqCst);
+        if idx == WORKER_IDLE {
+            return None;
+        }
+        let batch = self.current_batch.lock().unwrap();
+        batch.get(idx).cloned()
+    }
+}
+
+impl Default for WorkerState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Container for all worker states
+pub struct WorkerStates {
+    states: Vec<WorkerState>,
+}
+
+impl WorkerStates {
+    pub fn new(num_workers: usize) -> Self {
+        Self {
+            states: (0..num_workers).map(|_| WorkerState::new()).collect(),
+        }
+    }
+
+    pub fn get(&self, worker_id: usize) -> &WorkerState {
+        &self.states[worker_id]
+    }
+}
+
+// ============================================================================
 // Progress Display
 // ============================================================================
 
@@ -734,21 +864,49 @@ pub struct ProgressDisplay {
     start_time: Instant,
     machine_output: bool,
     last_reported_files: AtomicUsize,
-    progress_bar: Option<ProgressBar>,
+    /// MultiProgress container - must be kept alive for progress bars to render correctly
+    #[allow(dead_code)]
+    multi_progress: Option<MultiProgress>,
+    main_progress_bar: Option<ProgressBar>,
+    worker_bars: Vec<Option<ProgressBar>>,
+    verbose: bool,
 }
 
 impl ProgressDisplay {
-    pub fn new(total_files: usize, machine_output: bool) -> Self {
-        let progress_bar = if machine_output {
-            None
+    pub fn new(total_files: usize, machine_output: bool, num_workers: usize, verbose: bool) -> Self {
+        let (multi_progress, main_progress_bar, worker_bars) = if machine_output {
+            (None, None, Vec::new())
         } else {
-            let pb = ProgressBar::new(total_files as u64);
-            pb.set_style(
+            let mp = MultiProgress::new();
+
+            // Worker progress bars first (so they appear above the main bar)
+            // Only create them in verbose mode
+            let worker_bars: Vec<Option<ProgressBar>> = if verbose {
+                (0..num_workers)
+                    .map(|_| {
+                        let pb = mp.add(ProgressBar::new_spinner());
+                        pb.set_style(
+                            ProgressStyle::default_spinner()
+                                .template("{msg:.dim}")
+                                .unwrap(),
+                        );
+                        pb.set_message(""); // Empty initially
+                        Some(pb)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // Main progress bar at the bottom
+            let main_pb = mp.add(ProgressBar::new(total_files as u64));
+            main_pb.set_style(
                 ProgressStyle::default_bar()
                     .template("{msg}")
                     .unwrap(),
             );
-            Some(pb)
+
+            (Some(mp), Some(main_pb), worker_bars)
         };
 
         Self {
@@ -756,11 +914,14 @@ impl ProgressDisplay {
             start_time: Instant::now(),
             machine_output,
             last_reported_files: AtomicUsize::new(0),
-            progress_bar,
+            multi_progress,
+            main_progress_bar,
+            worker_bars,
+            verbose,
         }
     }
 
-    pub fn update(&self, stats: &TestStats, _files_completed: usize, batches_running: usize, _batches_remaining: usize, eta_seconds: Option<f64>) {
+    pub fn update(&mut self, stats: &TestStats, _files_completed: usize, batches_running: usize, _batches_remaining: usize, has_pending_batches: bool, eta_seconds: Option<f64>, worker_states: Option<&WorkerStates>) {
         let passed = stats.passed.load(Ordering::SeqCst);
         let failed = stats.failed.load(Ordering::SeqCst);
         let ignored = stats.ignored.load(Ordering::SeqCst);
@@ -797,7 +958,7 @@ impl ProgressDisplay {
                     percent, passed, failed, ignored, elapsed, eta
                 );
             }
-        } else if let Some(ref pb) = self.progress_bar {
+        } else if let Some(ref pb) = self.main_progress_bar {
             // Percentage based on tests completed vs total
             let percent = (tests_done as f64 / self.total_files.max(1) as f64) * 100.0;
 
@@ -835,11 +996,43 @@ impl ProgressDisplay {
                 eta, compiling_info, stuck_info
             );
             pb.set_message(msg);
+
+            // Update per-worker progress bars (verbose mode only)
+            if self.verbose {
+                if let Some(states) = worker_states {
+                    for (worker_id, worker_bar_opt) in self.worker_bars.iter_mut().enumerate() {
+                        if let Some(worker_bar) = worker_bar_opt {
+                            let state = states.get(worker_id);
+
+                            if let Some(test_name) = state.current_test() {
+                                // Show worker line with current test
+                                worker_bar.set_message(format!("  worker {}: {}", worker_id, test_name));
+                            } else if !has_pending_batches {
+                                // Worker idle and no batches waiting - hide the bar
+                                worker_bar.set_draw_target(ProgressDrawTarget::hidden());
+                                worker_bar.finish_and_clear();
+                                *worker_bar_opt = None;
+                            } else {
+                                // Worker is between tests - show status
+                                let status = state.get_status();
+                                worker_bar.set_message(format!("  worker {}: ({})", worker_id, status));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
     pub fn finish(&self, stats: &TestStats) {
-        if let Some(ref pb) = self.progress_bar {
+        // Clear worker bars first
+        for worker_bar_opt in &self.worker_bars {
+            if let Some(worker_bar) = worker_bar_opt {
+                worker_bar.finish_and_clear();
+            }
+        }
+
+        if let Some(ref pb) = self.main_progress_bar {
             pb.finish_and_clear();
         } else if self.machine_output {
             // Print final 100% status in machine mode
