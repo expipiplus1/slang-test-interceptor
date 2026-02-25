@@ -578,6 +578,8 @@ struct InFlightBatch {
     predicted_duration: f64,
     test_count: usize,
     kind: BatchKind,
+    /// Whether this batch was counted as "slow" for staggering
+    is_slow: bool,
 }
 
 /// A batch with its kind classification
@@ -612,6 +614,14 @@ pub struct Scheduler {
     gpu_in_flight: usize,
     /// Number of workers (for parallelism optimization)
     num_workers: usize,
+
+    /// Slow batch staggering: limit concurrent slow batches to avoid GPU contention
+    /// A batch is "slow" if predicted duration > slow_batch_threshold
+    slow_batch_threshold: f64,
+    /// Maximum concurrent slow batches (default: num_workers / 4, min 2)
+    max_concurrent_slow: usize,
+    /// Current number of slow batches in flight
+    slow_in_flight: usize,
 }
 
 impl Scheduler {
@@ -643,6 +653,12 @@ impl Scheduler {
 
         let predictions_arc = Arc::new(predictions.clone());
 
+        // Slow batch staggering: limit concurrent slow batches
+        // Threshold: batches predicted > 2x target duration are "slow"
+        let slow_batch_threshold = target_batch_duration * 2.0;
+        // Allow at most 1/4 of workers to run slow batches concurrently (min 2)
+        let max_concurrent_slow = (num_workers / 4).max(2);
+
         let scheduler = Self {
             rx,
             batches,
@@ -657,6 +673,9 @@ impl Scheduler {
             gpu_jobs,
             gpu_in_flight: 0,
             num_workers,
+            slow_batch_threshold,
+            max_concurrent_slow,
+            slow_in_flight: 0,
         };
 
         let handle = SchedulerHandle {
@@ -945,61 +964,74 @@ impl Scheduler {
         // Ensure enough batches to keep workers busy (avoid tail latency)
         self.ensure_parallelism();
 
-        // Determine if we can give out a GPU batch (check limit atomically here)
-        let can_give_gpu = match self.gpu_jobs {
-            None => true, // No GPU limiting
-            Some(max) => self.gpu_in_flight < max,
+        // Helper to calculate batch duration
+        let batch_duration = |b: &BatchWithKind| -> f64 {
+            b.tests.iter()
+                .map(|t| self.predictions.get(t).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
+                .sum()
         };
 
-        // Tail prioritization: when few batches remain, prioritize slow batches
-        // to avoid them becoming the long pole at the end.
+        // Determine constraints
+        let can_give_gpu = match self.gpu_jobs {
+            None => true,
+            Some(max) => self.gpu_in_flight < max,
+        };
+        let can_give_slow = self.slow_in_flight < self.max_concurrent_slow;
         let in_tail = self.batches.len() <= self.num_workers && self.has_timing_data;
 
         // Find and pop an appropriate batch
-        let batch_with_kind = if self.gpu_jobs.is_some() && !can_give_gpu {
-            // GPU slots full - must find a CPU batch only
-            let cpu_idx = if in_tail {
-                // In tail: find CPU batch with longest predicted duration
-                self.batches.iter()
+        // Priority: respect GPU limit > respect slow limit > tail prioritization > any batch
+        let batch_with_kind = if in_tail {
+            // In tail: prioritize longest batch (to avoid long pole)
+            // But still respect GPU limits
+            let valid_idx = self.batches.iter()
+                .enumerate()
+                .filter(|(_, b)| can_give_gpu || b.kind == BatchKind::Cpu)
+                .max_by(|(_, a), (_, b)| {
+                    batch_duration(a).partial_cmp(&batch_duration(b)).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(i, _)| i);
+            valid_idx.map(|i| self.batches.remove(i))
+        } else {
+            // Not in tail: try to find a batch that respects both GPU and slow limits
+            // First, try to find a fast batch (respects slow limit)
+            let dominated_by_slow = !can_give_slow && self.has_timing_data;
+
+            if dominated_by_slow {
+                // At slow limit - prefer fast batches
+                let fast_idx = self.batches.iter()
                     .enumerate()
-                    .filter(|(_, b)| b.kind == BatchKind::Cpu)
-                    .max_by(|(_, a), (_, b)| {
-                        let dur_a: f64 = a.tests.iter()
-                            .map(|t| self.predictions.get(t).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
-                            .sum();
-                        let dur_b: f64 = b.tests.iter()
-                            .map(|t| self.predictions.get(t).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
-                            .sum();
-                        dur_a.partial_cmp(&dur_b).unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                    .rev()
+                    .filter(|(_, b)| can_give_gpu || b.kind == BatchKind::Cpu)
+                    .filter(|(_, b)| batch_duration(b) <= self.slow_batch_threshold)
                     .map(|(i, _)| i)
-            } else {
-                // Not in tail: just find any CPU batch
-                self.batches.iter()
+                    .next();
+
+                if let Some(idx) = fast_idx {
+                    Some(self.batches.remove(idx))
+                } else {
+                    // No fast batches available - give slow batch anyway (don't block)
+                    // But still respect GPU limit
+                    let any_idx = self.batches.iter()
+                        .enumerate()
+                        .rev()
+                        .filter(|(_, b)| can_give_gpu || b.kind == BatchKind::Cpu)
+                        .map(|(i, _)| i)
+                        .next();
+                    any_idx.map(|i| self.batches.remove(i))
+                }
+            } else if !can_give_gpu {
+                // GPU slots full - must find a CPU batch
+                let cpu_idx = self.batches.iter()
                     .enumerate()
                     .rev()
                     .find(|(_, b)| b.kind == BatchKind::Cpu)
-                    .map(|(i, _)| i)
-            };
-            cpu_idx.map(|i| self.batches.remove(i))
-        } else if in_tail {
-            // In tail with timing data: pop batch with longest predicted duration
-            let longest_idx = self.batches.iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| {
-                    let dur_a: f64 = a.tests.iter()
-                        .map(|t| self.predictions.get(t).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
-                        .sum();
-                    let dur_b: f64 = b.tests.iter()
-                        .map(|t| self.predictions.get(t).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
-                        .sum();
-                    dur_a.partial_cmp(&dur_b).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(i, _)| i);
-            longest_idx.map(|i| self.batches.remove(i))
-        } else {
-            // Not in tail - just pop any batch (preserves random order)
-            self.batches.pop()
+                    .map(|(i, _)| i);
+                cpu_idx.map(|i| self.batches.remove(i))
+            } else {
+                // No constraints - just pop any batch
+                self.batches.pop()
+            }
         }?;
 
         let tests = batch_with_kind.tests;
@@ -1018,6 +1050,12 @@ impl Scheduler {
             self.gpu_in_flight += 1;
         }
 
+        // Track slow batch count
+        let is_slow = predicted_duration > self.slow_batch_threshold;
+        if is_slow {
+            self.slow_in_flight += 1;
+        }
+
         // Track as in-flight
         let batch_id = self.next_batch_id;
         self.next_batch_id += 1;
@@ -1027,6 +1065,7 @@ impl Scheduler {
             predicted_duration,
             test_count,
             kind,
+            is_slow,
         });
 
         Some(BatchAssignment { batch_id, tests, kind })
@@ -1037,6 +1076,9 @@ impl Scheduler {
         if let Some(batch) = self.in_flight.remove(&batch_id) {
             if batch.kind == BatchKind::Gpu {
                 self.gpu_in_flight -= 1;
+            }
+            if batch.is_slow {
+                self.slow_in_flight -= 1;
             }
         }
     }
