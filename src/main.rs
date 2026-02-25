@@ -37,6 +37,11 @@ pub struct Args {
     #[arg(short = 'j', long, default_value_t = num_cpus())]
     pub jobs: usize,
 
+    /// Maximum number of concurrent GPU jobs (vk/cuda/dx11/dx12/metal tests and gfx-unit-test-tool)
+    /// When set, batches are segmented into GPU-only and CPU-only batches
+    #[arg(short = 'g', long)]
+    pub gpu_jobs: Option<usize>,
+
     /// Maximum files per batch (with timing data, batches target ~10s duration up to this limit)
     #[arg(long, default_value_t = 100)]
     pub batch_size: usize,

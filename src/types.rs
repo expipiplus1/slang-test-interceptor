@@ -169,6 +169,42 @@ pub const EMA_NEW_WEIGHT: f64 = 0.7;
 pub const OUTPUT_TRUNCATE_LINES: usize = 30;
 
 // ============================================================================
+// Batch Kind (for GPU job limiting)
+// ============================================================================
+
+/// Classification of a batch for GPU job limiting
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchKind {
+    /// Batch contains only CPU tests (cpu, llvm backends or no API)
+    Cpu,
+    /// Batch contains only GPU tests (vk, cuda, dx11, dx12, metal or gfx-unit-test-tool)
+    Gpu,
+    /// Batch contains mixed tests or gpu_jobs is not set (no segmentation)
+    Mixed,
+}
+
+/// Check if a test is a GPU test based on its API or test name
+/// GPU tests: vk, cuda, dx11, dx12, metal backends, or gfx-unit-test-tool internal tests
+pub fn is_gpu_test(test: &str) -> bool {
+    let test_id = TestId::parse(test);
+
+    // gfx-unit-test-tool internal tests are GPU tests
+    if test_id.path.starts_with("gfx-unit-test-tool/") {
+        return true;
+    }
+
+    // Check API
+    match test_id.api.as_deref() {
+        Some(api) => {
+            let api_lower = api.to_lowercase();
+            matches!(api_lower.as_str(), "vk" | "vulkan" | "cuda" | "dx11" | "dx12" | "metal")
+        }
+        // No API specified - assume CPU (e.g., internal tests without API suffix)
+        None => false,
+    }
+}
+
+// ============================================================================
 // Event Logging
 // ============================================================================
 
@@ -490,11 +526,18 @@ struct InFlightBatch {
     start_time: Instant,
     predicted_duration: f64,
     test_count: usize,
+    kind: BatchKind,
+}
+
+/// A batch with its kind classification
+struct BatchWithKind {
+    tests: Vec<String>,
+    kind: BatchKind,
 }
 
 pub struct WorkPool {
     /// Pre-built batches of tests, ready to be popped by workers
-    batches: Mutex<Vec<Vec<String>>>,
+    batches: Mutex<Vec<BatchWithKind>>,
     /// Pending files that need to be rebuilt into batches (retries, repooled after crash)
     pending_files: Mutex<Vec<String>>,
     /// In-flight batches keyed by batch ID (for tracking remaining time)
@@ -509,6 +552,10 @@ pub struct WorkPool {
     /// Predictions keyed by test identifier (e.g., "tests/foo.slang.4")
     pub predictions: HashMap<String, f64>,
     pub has_timing_data: bool,
+    /// Maximum concurrent GPU batches (None = no limit, batches are Mixed)
+    gpu_jobs: Option<usize>,
+    /// Current number of in-flight GPU batches
+    gpu_in_flight: AtomicUsize,
 }
 
 impl WorkPool {
@@ -519,6 +566,7 @@ impl WorkPool {
         predictions: HashMap<String, f64>,
         has_timing_data: bool,
         target_batch_duration: f64,
+        gpu_jobs: Option<usize>,
     ) -> Self {
         let total_predicted: f64 = files.iter()
             .map(|f| predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
@@ -530,6 +578,7 @@ impl WorkPool {
             has_timing_data,
             max_batch_size,
             target_batch_duration,
+            gpu_jobs,
         );
 
         Self {
@@ -542,73 +591,128 @@ impl WorkPool {
             target_batch_duration,
             predictions,
             has_timing_data,
+            gpu_jobs,
+            gpu_in_flight: AtomicUsize::new(0),
         }
     }
 
     /// Build batches from a list of files.
     /// Files should be pre-sorted by duration (slowest first) if timing data is available.
+    /// When gpu_jobs is Some, tests are segmented into GPU-only and CPU-only batches.
     fn build_batches(
-        mut files: Vec<String>,
+        files: Vec<String>,
         predictions: &HashMap<String, f64>,
         has_timing_data: bool,
         max_batch_size: usize,
         target_batch_duration: f64,
-    ) -> Vec<Vec<String>> {
+        gpu_jobs: Option<usize>,
+    ) -> Vec<BatchWithKind> {
         if files.is_empty() {
             return Vec::new();
         }
 
+        // If gpu_jobs is set, separate files into GPU and CPU lists first
+        let (gpu_files, cpu_files): (Vec<String>, Vec<String>) = if gpu_jobs.is_some() {
+            files.into_iter().partition(|f| is_gpu_test(f))
+        } else {
+            (Vec::new(), files)
+        };
+
         let mut batches = Vec::new();
 
-        if has_timing_data {
-            // Sort by predicted duration, slowest first
-            files.sort_by(|a, b| {
-                let dur_a = predictions.get(a).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-                let dur_b = predictions.get(b).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-                dur_b.partial_cmp(&dur_a).unwrap_or(std::cmp::Ordering::Equal)
-            });
+        // Helper to build batches from a list of files with a given kind
+        let build_from_files = |files: Vec<String>, kind: BatchKind, batches: &mut Vec<BatchWithKind>| {
+            if files.is_empty() {
+                return;
+            }
 
-            // Build batches: slow tests get their own batch, fast tests are grouped
-            let mut current_batch = Vec::new();
-            let mut current_duration = 0.0;
+            let mut files = files;
 
-            for file in files {
-                let duration = predictions.get(&file).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+            if has_timing_data {
+                // Sort by predicted duration, slowest first
+                files.sort_by(|a, b| {
+                    let dur_a = predictions.get(a).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                    let dur_b = predictions.get(b).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                    dur_b.partial_cmp(&dur_a).unwrap_or(std::cmp::Ordering::Equal)
+                });
 
-                // If this test exceeds target duration, it gets its own batch
-                if duration > target_batch_duration {
-                    // Flush current batch first
-                    if !current_batch.is_empty() {
-                        batches.push(std::mem::take(&mut current_batch));
+                // Build batches: slow tests get their own batch, fast tests are grouped
+                let mut current_batch = Vec::new();
+                let mut current_duration = 0.0;
+
+                for file in files {
+                    let duration = predictions.get(&file).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+
+                    // If this test exceeds target duration, it gets its own batch
+                    if duration > target_batch_duration {
+                        // Flush current batch first
+                        if !current_batch.is_empty() {
+                            batches.push(BatchWithKind {
+                                tests: std::mem::take(&mut current_batch),
+                                kind,
+                            });
+                            current_duration = 0.0;
+                        }
+                        batches.push(BatchWithKind {
+                            tests: vec![file],
+                            kind,
+                        });
+                        continue;
+                    }
+
+                    // If adding this test would exceed target duration or max size, start new batch
+                    if !current_batch.is_empty()
+                        && (current_duration + duration > target_batch_duration
+                            || current_batch.len() >= max_batch_size)
+                    {
+                        batches.push(BatchWithKind {
+                            tests: std::mem::take(&mut current_batch),
+                            kind,
+                        });
                         current_duration = 0.0;
                     }
-                    batches.push(vec![file]);
-                    continue;
+
+                    current_batch.push(file);
+                    current_duration += duration;
                 }
 
-                // If adding this test would exceed target duration or max size, start new batch
-                if !current_batch.is_empty()
-                    && (current_duration + duration > target_batch_duration
-                        || current_batch.len() >= max_batch_size)
-                {
-                    batches.push(std::mem::take(&mut current_batch));
-                    current_duration = 0.0;
+                // Don't forget the last batch
+                if !current_batch.is_empty() {
+                    batches.push(BatchWithKind {
+                        tests: current_batch,
+                        kind,
+                    });
                 }
-
-                current_batch.push(file);
-                current_duration += duration;
+            } else {
+                // No timing data - just chunk into fixed-size batches
+                for chunk in files.chunks(max_batch_size) {
+                    batches.push(BatchWithKind {
+                        tests: chunk.to_vec(),
+                        kind,
+                    });
+                }
             }
+        };
 
-            // Don't forget the last batch
-            if !current_batch.is_empty() {
-                batches.push(current_batch);
-            }
+        if gpu_jobs.is_some() {
+            // Build separate GPU and CPU batches
+            build_from_files(gpu_files, BatchKind::Gpu, &mut batches);
+            build_from_files(cpu_files, BatchKind::Cpu, &mut batches);
         } else {
-            // No timing data - just chunk into fixed-size batches
-            for chunk in files.chunks(max_batch_size) {
-                batches.push(chunk.to_vec());
-            }
+            // No GPU limiting - all batches are Mixed
+            build_from_files(cpu_files, BatchKind::Mixed, &mut batches);
         }
+
+        // Sort by predicted duration (slowest first) across all batches
+        batches.sort_by(|a, b| {
+            let dur_a: f64 = a.tests.iter()
+                .map(|f| predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
+                .sum();
+            let dur_b: f64 = b.tests.iter()
+                .map(|f| predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
+                .sum();
+            dur_b.partial_cmp(&dur_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Reverse so we can pop from the end (O(1)) and get slowest batches first
         batches.reverse();
@@ -640,15 +744,25 @@ impl WorkPool {
         let batches = self.batches.lock().unwrap();
         let pending = self.pending_files.lock().unwrap();
         let in_flight = self.in_flight.lock().unwrap();
-        let pool_count: usize = batches.iter().map(|b| b.len()).sum::<usize>() + pending.len();
+        let pool_count: usize = batches.iter().map(|b| b.tests.len()).sum::<usize>() + pending.len();
         let in_flight_count: usize = in_flight.values().map(|b| b.test_count).sum();
         pool_count + in_flight_count
     }
 
+    /// Check if there's a GPU slot available
+    pub fn can_take_gpu_batch(&self) -> bool {
+        match self.gpu_jobs {
+            None => true, // No GPU limiting
+            Some(max) => self.gpu_in_flight.load(Ordering::SeqCst) < max,
+        }
+    }
+
     /// Get the next batch of tests to run.
-    /// Returns (batch_id, tests) where batch_id is used to mark the batch complete later.
+    /// Returns (batch_id, tests, kind) where batch_id is used to mark the batch complete later.
     /// If there are pending files (retries/repooled), rebuilds batches first.
-    pub fn try_get_batch(&self) -> Option<(usize, Vec<String>)> {
+    ///
+    /// When `has_gpu_slot` is false and gpu_jobs is set, GPU batches will be skipped.
+    pub fn try_get_batch(&self, has_gpu_slot: bool) -> Option<(usize, Vec<String>, BatchKind)> {
         // Check if we need to rebuild batches due to pending files
         {
             let mut pending = self.pending_files.lock().unwrap();
@@ -659,7 +773,7 @@ impl WorkPool {
                 // Collect all remaining tests: pending + already batched
                 let mut all_files: Vec<String> = pending.drain(..).collect();
                 for batch in batches.drain(..) {
-                    all_files.extend(batch);
+                    all_files.extend(batch.tests);
                 }
 
                 // Recalculate pool_predicted from all_files
@@ -674,12 +788,34 @@ impl WorkPool {
                     self.has_timing_data,
                     self.max_batch_size,
                     self.target_batch_duration,
+                    self.gpu_jobs,
                 );
             }
         }
 
-        // Pop the next batch
-        let batch = self.batches.lock().unwrap().pop()?;
+        // Find and pop an appropriate batch
+        let batch_with_kind = {
+            let mut batches = self.batches.lock().unwrap();
+
+            if self.gpu_jobs.is_none() || has_gpu_slot {
+                // No GPU limiting or we have a slot - just pop the next batch
+                batches.pop()
+            } else {
+                // GPU limiting is active and we don't have a slot - find a CPU batch
+                // Search from the end (where we pop from) for efficiency
+                let mut cpu_idx = None;
+                for (i, batch) in batches.iter().enumerate().rev() {
+                    if batch.kind == BatchKind::Cpu {
+                        cpu_idx = Some(i);
+                        break;
+                    }
+                }
+                cpu_idx.map(|i| batches.remove(i))
+            }
+        }?;
+
+        let batch = batch_with_kind.tests;
+        let kind = batch_with_kind.kind;
 
         // Calculate predicted duration for this batch
         let predicted_duration: f64 = batch.iter()
@@ -689,6 +825,11 @@ impl WorkPool {
         // Subtract from pool predicted
         *self.pool_predicted.lock().unwrap() -= predicted_duration;
 
+        // Track GPU batch count
+        if kind == BatchKind::Gpu {
+            self.gpu_in_flight.fetch_add(1, Ordering::SeqCst);
+        }
+
         // Track as in-flight
         let batch_id = self.next_batch_id.fetch_add(1, Ordering::SeqCst);
         let test_count = batch.len();
@@ -696,14 +837,20 @@ impl WorkPool {
             start_time: Instant::now(),
             predicted_duration,
             test_count,
+            kind,
         });
 
-        Some((batch_id, batch))
+        Some((batch_id, batch, kind))
     }
 
     /// Mark a batch as complete (tests finished running)
     pub fn complete_batch(&self, batch_id: usize) {
-        self.in_flight.lock().unwrap().remove(&batch_id);
+        let removed = self.in_flight.lock().unwrap().remove(&batch_id);
+        if let Some(batch) = removed {
+            if batch.kind == BatchKind::Gpu {
+                self.gpu_in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
     }
 
     /// Calculate estimated time remaining.
@@ -1082,3 +1229,101 @@ fn get_gpu_usage() -> Option<u32> {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_gpu_test() {
+        // GPU tests - various backends
+        assert!(is_gpu_test("tests/compute/foo.slang.0 (vk)"));
+        assert!(is_gpu_test("tests/compute/foo.slang.1 (cuda)"));
+        assert!(is_gpu_test("tests/compute/foo.slang.2 (dx11)"));
+        assert!(is_gpu_test("tests/compute/foo.slang.3 (dx12)"));
+        assert!(is_gpu_test("tests/compute/foo.slang.4 (metal)"));
+        assert!(is_gpu_test("tests/compute/foo.slang.5 (vulkan)"));
+        
+        // GPU tests - gfx-unit-test-tool
+        assert!(is_gpu_test("gfx-unit-test-tool/someTest.internal"));
+        assert!(is_gpu_test("gfx-unit-test-tool/anotherTest.internal.0"));
+        
+        // CPU tests
+        assert!(!is_gpu_test("tests/compute/foo.slang.0 (cpu)"));
+        assert!(!is_gpu_test("tests/compute/foo.slang.1 (llvm)"));
+        assert!(!is_gpu_test("slang-unit-test-tool/modulePtr.internal"));
+        assert!(!is_gpu_test("tests/compute/foo.slang")); // No API suffix
+        
+        // Synthesized tests
+        assert!(is_gpu_test("tests/compute/foo.slang.0 syn (vk)"));
+        assert!(!is_gpu_test("tests/compute/foo.slang.0 syn (cpu)"));
+    }
+
+    #[test]
+    fn test_batch_kind_segmentation() {
+        let files = vec![
+            "tests/a.slang.0 (vk)".to_string(),
+            "tests/b.slang.0 (cpu)".to_string(),
+            "tests/c.slang.0 (cuda)".to_string(),
+            "tests/d.slang.0 (llvm)".to_string(),
+            "gfx-unit-test-tool/test.internal".to_string(),
+        ];
+        
+        let predictions = HashMap::new();
+        
+        // With gpu_jobs set, batches should be segmented
+        let batches = WorkPool::build_batches(
+            files.clone(),
+            &predictions,
+            false,
+            100,
+            10.0,
+            Some(2),
+        );
+        
+        // Should have at least one GPU batch and one CPU batch
+        let gpu_batches: Vec<_> = batches.iter().filter(|b| b.kind == BatchKind::Gpu).collect();
+        let cpu_batches: Vec<_> = batches.iter().filter(|b| b.kind == BatchKind::Cpu).collect();
+        
+        assert!(!gpu_batches.is_empty(), "Should have GPU batches");
+        assert!(!cpu_batches.is_empty(), "Should have CPU batches");
+        
+        // Verify GPU batches only contain GPU tests
+        for batch in &gpu_batches {
+            for test in &batch.tests {
+                assert!(is_gpu_test(test), "GPU batch should only contain GPU tests: {}", test);
+            }
+        }
+        
+        // Verify CPU batches only contain CPU tests
+        for batch in &cpu_batches {
+            for test in &batch.tests {
+                assert!(!is_gpu_test(test), "CPU batch should only contain CPU tests: {}", test);
+            }
+        }
+    }
+
+    #[test]
+    fn test_no_segmentation_without_gpu_jobs() {
+        let files = vec![
+            "tests/a.slang.0 (vk)".to_string(),
+            "tests/b.slang.0 (cpu)".to_string(),
+        ];
+        
+        let predictions = HashMap::new();
+        
+        // Without gpu_jobs, all batches should be Mixed
+        let batches = WorkPool::build_batches(
+            files,
+            &predictions,
+            false,
+            100,
+            10.0,
+            None,
+        );
+        
+        for batch in &batches {
+            assert_eq!(batch.kind, BatchKind::Mixed, "Without gpu_jobs, all batches should be Mixed");
+        }
+    }
+}

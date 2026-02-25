@@ -1107,6 +1107,7 @@ impl TestRunner {
             predictions,
             has_timing_data,
             self.args.batch_duration,
+            self.args.gpu_jobs,
         ));
 
         let stats = self.stats.clone();
@@ -1200,8 +1201,11 @@ impl TestRunner {
                             break;
                         }
 
+                        // Check if we can take a GPU batch
+                        let has_gpu_slot = pool.can_take_gpu_batch();
+
                         let get_batch_start = Instant::now();
-                        if let Some((batch_id, batch)) = pool.try_get_batch() {
+                        if let Some((batch_id, batch, _kind)) = pool.try_get_batch(has_gpu_slot) {
                             let get_batch_time = get_batch_start.elapsed();
                             if get_batch_time.as_millis() > 10 {
                                 debug_log!("worker {} try_get_batch took {:.3}s", worker_id, get_batch_time.as_secs_f64());

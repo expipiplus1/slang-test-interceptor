@@ -43,6 +43,9 @@ sti --ignore 'compute'
 # Specific APIs
 sti --api vk
 sti --ignore-api cuda
+
+# Limit concurrent GPU tests (useful when GPU memory is limited)
+sti -g 4
 ```
 
 ## Options
@@ -52,6 +55,7 @@ sti --ignore-api cuda
 - `<FILTERS>` - Regex patterns to filter tests (union: test runs if it matches ANY filter). Examples: `diagnostic` (infix), `^tests/compute` (prefix), `\.slang$` (suffix). If empty, runs all tests.
 - `-C, --root-dir <PATH>` - Root directory of the slang project (default: current directory)
 - `-j, --jobs <N>` - Number of parallel workers (default: number of CPUs)
+- `-g, --gpu-jobs <N>` - Maximum concurrent GPU batches (vk/cuda/dx11/dx12/metal and gfx-unit-test-tool tests). When set, tests are segmented into GPU-only and CPU-only batches, and at most N GPU batches run concurrently. Useful when GPU memory is limited.
 - `--dry-run` - List tests that would be run without actually running them
 - `--ignore <PATTERN>` - Ignore tests matching regex pattern (can be specified multiple times; union: ignored if matches ANY)
 - `--api <API>` - Only run tests for specific APIs (can be specified multiple times; union: runs if matches ANY). Examples: `--api vk --api cuda`
