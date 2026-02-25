@@ -335,6 +335,13 @@ fn process_outcome(
         ctx.stats.record_file(&base_file);
     }
 
+    // Add the predicted time for this test to completed total
+    let timing_key = TestId::parse(&outcome.name).to_timing_key();
+    let predicted = ctx.work_pool.predictions.get(&timing_key)
+        .copied()
+        .unwrap_or(DEFAULT_PREDICTED_DURATION);
+    ctx.stats.add_completed_predicted_time(predicted);
+
     match outcome.result {
         TestResult::Passed => {
             let was_retry = ctx.retried_tests.lock().unwrap().contains_key(&outcome.name);

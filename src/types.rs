@@ -1,4 +1,4 @@
-use rand::Rng;
+use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use sysinfo::{CpuRefreshKind, RefreshKind, System};
 use std::collections::{HashMap, HashSet};
@@ -420,6 +420,8 @@ pub struct TestStats {
     pub compiling_since: Mutex<Option<Instant>>,
     /// Observed timings keyed by test identifier (e.g., "tests/foo.slang.4")
     pub observed_timings: Mutex<HashMap<String, f64>>,
+    /// Sum of predicted times for completed tests (for accurate progress %)
+    pub completed_predicted_time: Mutex<f64>,
 }
 
 impl TestStats {
@@ -470,6 +472,16 @@ impl TestStats {
     pub fn get_observed_timings(&self) -> HashMap<String, f64> {
         self.observed_timings.lock().unwrap().clone()
     }
+
+    /// Add to the completed predicted time total
+    pub fn add_completed_predicted_time(&self, time: f64) {
+        *self.completed_predicted_time.lock().unwrap() += time;
+    }
+
+    /// Get the sum of predicted times for completed tests
+    pub fn get_completed_predicted_time(&self) -> f64 {
+        *self.completed_predicted_time.lock().unwrap()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -485,21 +497,26 @@ pub struct FailureInfo {
 // ============================================================================
 
 pub struct WorkPool {
-    files: Mutex<Vec<String>>,
+    /// Pre-built batches of tests, ready to be popped by workers
+    batches: Mutex<Vec<Vec<String>>>,
+    /// Pending files that need to be rebuilt into batches (retries, repooled after crash)
+    pending_files: Mutex<Vec<String>>,
+    /// Predicted time remaining in the pool (batches + pending, not in-flight)
+    predicted_remaining: Mutex<f64>,
+    /// Configuration for batch building
     max_batch_size: usize,
-    num_workers: usize,
+    target_batch_duration: f64,
     /// Predictions keyed by test identifier (e.g., "tests/foo.slang.4")
     pub predictions: HashMap<String, f64>,
     pub total_predicted: f64,
     pub has_timing_data: bool,
-    target_batch_duration: f64,
 }
 
 impl WorkPool {
     pub fn new(
         files: Vec<String>,
         max_batch_size: usize,
-        num_workers: usize,
+        _num_workers: usize,
         predictions: HashMap<String, f64>,
         has_timing_data: bool,
         target_batch_duration: f64,
@@ -507,164 +524,159 @@ impl WorkPool {
         let total_predicted: f64 = files.iter()
             .map(|f| predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
             .sum();
-        Self {
-            files: Mutex::new(files),
+
+        let batches = Self::build_batches(
+            files,
+            &predictions,
+            has_timing_data,
             max_batch_size,
-            num_workers,
+            target_batch_duration,
+        );
+
+        Self {
+            batches: Mutex::new(batches),
+            pending_files: Mutex::new(Vec::new()),
+            predicted_remaining: Mutex::new(total_predicted),
+            max_batch_size,
+            target_batch_duration,
             predictions,
             total_predicted,
             has_timing_data,
-            target_batch_duration,
         }
+    }
+
+    /// Build batches from a list of files.
+    /// Files should be pre-sorted by duration (slowest first) if timing data is available.
+    fn build_batches(
+        mut files: Vec<String>,
+        predictions: &HashMap<String, f64>,
+        has_timing_data: bool,
+        max_batch_size: usize,
+        target_batch_duration: f64,
+    ) -> Vec<Vec<String>> {
+        if files.is_empty() {
+            return Vec::new();
+        }
+
+        let mut batches = Vec::new();
+
+        if has_timing_data {
+            // Sort by predicted duration, slowest first
+            files.sort_by(|a, b| {
+                let dur_a = predictions.get(a).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                let dur_b = predictions.get(b).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                dur_b.partial_cmp(&dur_a).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            // Build batches: slow tests get their own batch, fast tests are grouped
+            let mut current_batch = Vec::new();
+            let mut current_duration = 0.0;
+
+            for file in files {
+                let duration = predictions.get(&file).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+
+                // If this test exceeds target duration, it gets its own batch
+                if duration > target_batch_duration {
+                    // Flush current batch first
+                    if !current_batch.is_empty() {
+                        batches.push(std::mem::take(&mut current_batch));
+                        current_duration = 0.0;
+                    }
+                    batches.push(vec![file]);
+                    continue;
+                }
+
+                // If adding this test would exceed target duration or max size, start new batch
+                if !current_batch.is_empty()
+                    && (current_duration + duration > target_batch_duration
+                        || current_batch.len() >= max_batch_size)
+                {
+                    batches.push(std::mem::take(&mut current_batch));
+                    current_duration = 0.0;
+                }
+
+                current_batch.push(file);
+                current_duration += duration;
+            }
+
+            // Don't forget the last batch
+            if !current_batch.is_empty() {
+                batches.push(current_batch);
+            }
+        } else {
+            // No timing data - just chunk into fixed-size batches
+            for chunk in files.chunks(max_batch_size) {
+                batches.push(chunk.to_vec());
+            }
+        }
+
+        // Reverse so we can pop from the end (O(1)) and get slowest batches first
+        batches.reverse();
+        batches
     }
 
     pub fn predicted_remaining(&self) -> f64 {
-        let files = self.files.lock().unwrap();
-        files.iter()
-            .map(|f| self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
-            .sum()
+        *self.predicted_remaining.lock().unwrap()
     }
 
+    /// Add a file back to the pool (for retries or repooled tests after crash).
+    /// This triggers a rebuild of batches on the next try_get_batch call.
     pub fn add_file(&self, file: String) {
-        self.files.lock().unwrap().push(file);
+        let predicted = self.predictions.get(&file).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+        *self.predicted_remaining.lock().unwrap() += predicted;
+        self.pending_files.lock().unwrap().push(file);
     }
 
     pub fn is_empty(&self) -> bool {
-        self.files.lock().unwrap().is_empty()
+        self.batches.lock().unwrap().is_empty() && self.pending_files.lock().unwrap().is_empty()
     }
 
     pub fn remaining(&self) -> usize {
-        self.files.lock().unwrap().len()
+        let batches = self.batches.lock().unwrap();
+        let pending = self.pending_files.lock().unwrap();
+        batches.iter().map(|b| b.len()).sum::<usize>() + pending.len()
     }
 
-    fn select_slow_biased_index(&self, files: &[String]) -> usize {
-        if files.len() <= 2 {
-            return 0;
-        }
-
-        if self.has_timing_data {
-            let mut indexed: Vec<(usize, f64)> = files.iter().enumerate()
-                .map(|(i, f)| {
-                    let dur = self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-                    (i, dur)
-                })
-                .collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            let n = indexed.len();
-            // Decay so that test at position n/4 has ~5% of the weight of the slowest test.
-            // This ensures slow tests are strongly preferred while still allowing some randomness.
-            // exp(-decay * n/4) = 0.05  =>  decay = -ln(0.05) / (n/4) = 3 * 4 / n = 12/n
-            let decay = 12.0 / n as f64;
-            let weights: Vec<f64> = (0..n)
-                .map(|i| (-decay * i as f64).exp())
-                .collect();
-
-            let total_weight: f64 = weights.iter().sum();
-            let mut rng = rand::thread_rng();
-            let mut choice = rng.gen_range(0.0..total_weight);
-
-            for (i, &weight) in weights.iter().enumerate() {
-                choice -= weight;
-                if choice <= 0.0 {
-                    return indexed[i].0;
-                }
-            }
-            indexed[n - 1].0
-        } else {
-            let mut rng = rand::thread_rng();
-            rng.gen_range(0..files.len())
-        }
-    }
-
-    /// Find the index of a test that exceeds the target batch duration (if any).
-    /// These "oversized" tests should be scheduled first to avoid long tails.
-    fn find_oversized_test_index(&self, files: &[String]) -> Option<usize> {
-        if !self.has_timing_data {
-            return None;
-        }
-
-        // Find the test with the longest duration that exceeds target
-        let mut best_idx = None;
-        let mut best_duration = self.target_batch_duration;
-
-        for (i, f) in files.iter().enumerate() {
-            let dur = self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-            if dur > best_duration {
-                best_duration = dur;
-                best_idx = Some(i);
-            }
-        }
-
-        best_idx
-    }
-
+    /// Get the next batch of tests to run.
+    /// If there are pending files (retries/repooled), rebuilds batches first.
     pub fn try_get_batch(&self) -> Option<Vec<String>> {
-        let mut files = self.files.lock().unwrap();
-        if files.is_empty() {
-            return None;
-        }
+        // Check if we need to rebuild batches due to pending files
+        {
+            let mut pending = self.pending_files.lock().unwrap();
+            if !pending.is_empty() {
+                let mut batches = self.batches.lock().unwrap();
 
-        let remaining = files.len();
-
-        if remaining <= self.num_workers * 2 {
-            return Some(vec![files.pop().unwrap()]);
-        }
-
-        if self.has_timing_data {
-            // First priority: schedule any test that exceeds target batch duration.
-            // These tests will always be their own batch, so schedule them ASAP
-            // to avoid long tails at the end of the run.
-            if let Some(idx) = self.find_oversized_test_index(&files) {
-                return Some(vec![files.swap_remove(idx)]);
-            }
-
-            let mut batch = Vec::new();
-            let mut batch_duration = 0.0;
-
-            while !files.is_empty() {
-                let idx = self.select_slow_biased_index(&files);
-                let file = &files[idx];
-                let file_duration = self.predictions.get(file).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-
-                if batch.is_empty() {
-                    batch.push(files.swap_remove(idx));
-                    batch_duration += file_duration;
-                } else if batch_duration + file_duration <= self.target_batch_duration
-                          && batch.len() < self.max_batch_size {
-                    batch.push(files.swap_remove(idx));
-                    batch_duration += file_duration;
-                } else {
-                    break;
+                // Collect all remaining tests: pending + already batched
+                let mut all_files: Vec<String> = pending.drain(..).collect();
+                for batch in batches.drain(..) {
+                    all_files.extend(batch);
                 }
+
+                // Rebuild batches (predicted_remaining already includes pending times)
+                *batches = Self::build_batches(
+                    all_files,
+                    &self.predictions,
+                    self.has_timing_data,
+                    self.max_batch_size,
+                    self.target_batch_duration,
+                );
             }
-
-            if batch.is_empty() { None } else { Some(batch) }
-        } else {
-            let batch_size = self.max_batch_size.min(remaining);
-            let mut rng = rand::thread_rng();
-
-            let mut batch = Vec::with_capacity(batch_size);
-            for _ in 0..batch_size {
-                if files.is_empty() {
-                    break;
-                }
-                let idx = rng.gen_range(0..files.len());
-                batch.push(files.swap_remove(idx));
-            }
-
-            if batch.is_empty() { None } else { Some(batch) }
         }
+
+        // Pop the next batch and subtract its predicted time
+        let batch = self.batches.lock().unwrap().pop()?;
+        let batch_predicted: f64 = batch.iter()
+            .map(|f| self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
+            .sum();
+        *self.predicted_remaining.lock().unwrap() -= batch_predicted;
+        Some(batch)
     }
 
+    /// Get a single-test batch (used for adaptive spawning)
     pub fn try_get_medium_batch(&self) -> Option<Vec<String>> {
-        let mut files = self.files.lock().unwrap();
-        if files.is_empty() {
-            return None;
-        }
-
-        let idx = self.select_slow_biased_index(&files);
-        Some(vec![files.swap_remove(idx)])
+        // For adaptive spawning, just get a regular batch
+        // The batches are already well-formed
+        self.try_get_batch()
     }
 }
 
@@ -711,13 +723,12 @@ impl ProgressDisplay {
                 );
             }
         } else {
-            let percent = if let Some(remaining) = predicted_remaining_time {
-                if self.total_predicted_time > 0.0 {
-                    let completed_time = self.total_predicted_time - remaining;
-                    (completed_time / self.total_predicted_time * 100.0).clamp(0.0, 100.0)
-                } else {
-                    (files_completed as f64 / self.total_files.max(1) as f64) * 100.0
-                }
+            // Calculate percentage based on completed predicted time vs total
+            // percent = completed / (completed + remaining + in_flight)
+            // Since we don't track in_flight separately, use: completed / total_predicted
+            let completed_predicted = stats.get_completed_predicted_time();
+            let percent = if self.total_predicted_time > 0.0 {
+                (completed_predicted / self.total_predicted_time * 100.0).clamp(0.0, 100.0)
             } else {
                 (files_completed as f64 / self.total_files.max(1) as f64) * 100.0
             };
@@ -748,7 +759,7 @@ impl ProgressDisplay {
 
             let stuck_info = if let Some(secs) = stats.seconds_since_last_output() {
                 if secs > 1.0 {
-                    format!(" \x1b[2m[waiting {:.0}s r={}]\x1b[0m", secs, batches_running)
+                    format!(" {}", format!("[waiting {:.0}s]", secs).dimmed())
                 } else {
                     String::new()
                 }
