@@ -823,19 +823,9 @@ impl Scheduler {
             build_from_files(cpu_files, BatchKind::Mixed, &mut batches);
         }
 
-        // Sort by predicted duration (slowest first) across all batches
-        batches.sort_by(|a, b| {
-            let dur_a: f64 = a.tests.iter()
-                .map(|f| predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
-                .sum();
-            let dur_b: f64 = b.tests.iter()
-                .map(|f| predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
-                .sum();
-            dur_b.partial_cmp(&dur_a).unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Reverse so we can pop from the end (O(1)) and get slowest batches first
-        batches.reverse();
+        // Don't sort batches - rely on random input order to spread GPU tests
+        // and tail prioritization (in try_get_batch) to handle slow tests at the end.
+        // Sorting by duration front-loads slow GPU tests, causing contention.
         batches
     }
 
@@ -913,25 +903,13 @@ impl Scheduler {
             right = all_tests[mid..].to_vec();
         }
 
-        // Re-insert both batches
+        // Re-insert both batches (no sorting - tail prioritization handles selection)
         if !left.is_empty() {
             self.batches.push(BatchWithKind { tests: left, kind });
         }
         if !right.is_empty() {
             self.batches.push(BatchWithKind { tests: right, kind });
         }
-
-        // Re-sort to maintain invariant (smallest first, so we pop largest)
-        self.batches.sort_by(|a, b| {
-            let dur_a: f64 = a.tests.iter()
-                .map(|f| self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
-                .sum();
-            let dur_b: f64 = b.tests.iter()
-                .map(|f| self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
-                .sum();
-            // Smallest first (we pop from end to get largest)
-            dur_a.partial_cmp(&dur_b).unwrap_or(std::cmp::Ordering::Equal)
-        });
 
         true
     }
@@ -973,23 +951,55 @@ impl Scheduler {
             Some(max) => self.gpu_in_flight < max,
         };
 
+        // Tail prioritization: when few batches remain, prioritize slow batches
+        // to avoid them becoming the long pole at the end.
+        let in_tail = self.batches.len() <= self.num_workers && self.has_timing_data;
+
         // Find and pop an appropriate batch
-        let batch_with_kind = if self.gpu_jobs.is_none() {
-            // No GPU limiting - just pop any batch
-            self.batches.pop()
-        } else if can_give_gpu {
-            // GPU slot available - pop any batch (GPU or CPU)
-            self.batches.pop()
-        } else {
+        let batch_with_kind = if self.gpu_jobs.is_some() && !can_give_gpu {
             // GPU slots full - must find a CPU batch only
-            let mut cpu_idx = None;
-            for (i, batch) in self.batches.iter().enumerate().rev() {
-                if batch.kind == BatchKind::Cpu {
-                    cpu_idx = Some(i);
-                    break;
-                }
-            }
+            let cpu_idx = if in_tail {
+                // In tail: find CPU batch with longest predicted duration
+                self.batches.iter()
+                    .enumerate()
+                    .filter(|(_, b)| b.kind == BatchKind::Cpu)
+                    .max_by(|(_, a), (_, b)| {
+                        let dur_a: f64 = a.tests.iter()
+                            .map(|t| self.predictions.get(t).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
+                            .sum();
+                        let dur_b: f64 = b.tests.iter()
+                            .map(|t| self.predictions.get(t).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
+                            .sum();
+                        dur_a.partial_cmp(&dur_b).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(i, _)| i)
+            } else {
+                // Not in tail: just find any CPU batch
+                self.batches.iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, b)| b.kind == BatchKind::Cpu)
+                    .map(|(i, _)| i)
+            };
             cpu_idx.map(|i| self.batches.remove(i))
+        } else if in_tail {
+            // In tail with timing data: pop batch with longest predicted duration
+            let longest_idx = self.batches.iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| {
+                    let dur_a: f64 = a.tests.iter()
+                        .map(|t| self.predictions.get(t).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
+                        .sum();
+                    let dur_b: f64 = b.tests.iter()
+                        .map(|t| self.predictions.get(t).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
+                        .sum();
+                    dur_a.partial_cmp(&dur_b).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(i, _)| i);
+            longest_idx.map(|i| self.batches.remove(i))
+        } else {
+            // Not in tail - just pop any batch (preserves random order)
+            self.batches.pop()
         }?;
 
         let tests = batch_with_kind.tests;

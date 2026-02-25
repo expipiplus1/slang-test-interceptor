@@ -47,7 +47,7 @@ pub struct Args {
     pub batch_size: usize,
 
     /// Target batch duration in seconds (only used with timing cache)
-    #[arg(long, default_value_t = 10.0)]
+    #[arg(long, default_value_t = 3.0)]
     pub batch_duration: f64,
 
     /// Number of retries for failed tests

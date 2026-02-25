@@ -1,6 +1,7 @@
 use anyhow::Result;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::seq::SliceRandom;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -40,18 +41,43 @@ macro_rules! debug_log {
 // ETA Calculation and Display
 // ============================================================================
 
-/// Calculate initial ETA from predictions.
-/// ETA = max(total_predicted / num_workers, longest_single_test)
-/// This accounts for the "long pole" problem where one slow test dominates.
-fn calculate_initial_eta(predictions: impl Iterator<Item = f64>, num_workers: usize) -> f64 {
-    let mut total = 0.0f64;
+/// Calculate initial ETA from predictions, accounting for GPU job limits.
+/// When --gpu-jobs is set, GPU tests are limited to that many concurrent workers,
+/// which can significantly increase ETA if most tests are GPU tests.
+fn calculate_initial_eta(
+    predictions: &HashMap<String, f64>,
+    num_workers: usize,
+    gpu_jobs: Option<usize>,
+) -> f64 {
+    let mut gpu_total = 0.0f64;
+    let mut cpu_total = 0.0f64;
     let mut longest = 0.0f64;
-    for pred in predictions {
-        total += pred;
+
+    for (test, &pred) in predictions {
         longest = longest.max(pred);
+        if is_gpu_test(test) {
+            gpu_total += pred;
+        } else {
+            cpu_total += pred;
+        }
     }
-    let parallel_eta = total / num_workers.max(1) as f64;
-    parallel_eta.max(longest)
+
+    match gpu_jobs {
+        Some(max_gpu) => {
+            // GPU tests limited to max_gpu concurrent workers
+            // CPU tests can use all workers
+            let gpu_workers = max_gpu.min(num_workers);
+            let gpu_eta = gpu_total / gpu_workers.max(1) as f64;
+            let cpu_eta = cpu_total / num_workers.max(1) as f64;
+            // GPU and CPU batches run in parallel, so take the longer path
+            gpu_eta.max(cpu_eta).max(longest)
+        }
+        None => {
+            // No GPU limiting - all workers can run anything
+            let total = gpu_total + cpu_total;
+            (total / num_workers.max(1) as f64).max(longest)
+        }
+    }
 }
 
 /// Format the "Running N tests with M workers" message.
@@ -1154,35 +1180,17 @@ impl TestRunner {
                 .collect()
         };
 
-        let sorted_files: Vec<String> = if has_timing_data {
-            let mut files_with_duration: Vec<_> = test_files.iter()
-                .map(|f| (f.clone(), *predictions.get(f).unwrap_or(&DEFAULT_PREDICTED_DURATION)))
-                .collect();
-            files_with_duration.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            let n = self.args.jobs;
-            let mut slots: Vec<Vec<String>> = (0..n).map(|_| Vec::new()).collect();
-
-            for (i, (file, _)) in files_with_duration.into_iter().enumerate() {
-                slots[i % n].push(file);
-            }
-
-            let mut result = Vec::with_capacity(test_files.len());
-            let max_len = slots.iter().map(|s| s.len()).max().unwrap_or(0);
-            for i in 0..max_len {
-                for slot in &slots {
-                    if i < slot.len() {
-                        result.push(slot[i].clone());
-                    }
-                }
-            }
-            result
-        } else {
-            test_files.to_vec()
+        // Shuffle tests randomly to avoid GPU contention from alphabetical ordering.
+        // With timing data, we use tail prioritization (in scheduler) to avoid long pole.
+        // Without timing data, random order is still better than alphabetical for GPU spread.
+        let sorted_files: Vec<String> = {
+            let mut files = test_files.to_vec();
+            files.shuffle(&mut rand::thread_rng());
+            files
         };
 
         let eta = if has_timing_data {
-            Some(calculate_initial_eta(predictions.values().copied(), self.args.jobs))
+            Some(calculate_initial_eta(&predictions, self.args.jobs, self.args.gpu_jobs))
         } else {
             None
         };
