@@ -22,9 +22,19 @@
 
         craneLibNative = crane.mkLib pkgsNative;
 
+        # Default build without gpu-info feature
         sti = craneLibNative.buildPackage {
           src = craneLibNative.cleanCargoSource ./.;
           strictDeps = true;
+        };
+
+        # Build with gpu-info feature (requires libdrm)
+        sti-gpu = craneLibNative.buildPackage {
+          src = craneLibNative.cleanCargoSource ./.;
+          strictDeps = true;
+          cargoExtraArgs = "--features gpu-info";
+          nativeBuildInputs = [ pkgsNative.pkg-config ];
+          buildInputs = [ pkgsNative.libdrm ];
         };
 
         # Helper for static Linux musl builds
@@ -113,6 +123,9 @@
         packages = {
           default = sti;
 
+          # Build with GPU info feature (requires libdrm)
+          gpu = sti-gpu;
+
           # Cross-compiled static Linux binaries (no external dependencies)
           x86_64-linux-static = sti-x86_64-linux;
           aarch64-linux-static = sti-aarch64-linux;
@@ -127,7 +140,7 @@
         };
 
         devShells.default = craneLibNative.devShell {
-          packages = [ ];
+          packages = [ pkgsNative.pkg-config pkgsNative.libdrm ];
         };
       }
     );

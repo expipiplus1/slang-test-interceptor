@@ -7,6 +7,10 @@ edition = "2021"
 name = "sti"
 path = "src/main.rs"
 
+[features]
+default = []
+gpu-info = ["dep:gfxinfo"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 regex = "1"
@@ -21,3 +25,4 @@ serde_json = "1"
 dirs = "5"
 indicatif = "0.17"
 os_pipe = "1"
+gfxinfo = { version = "0.1", features = ["gpu_info"], optional = true }

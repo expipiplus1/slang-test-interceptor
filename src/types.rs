@@ -968,6 +968,14 @@ pub struct ProgressDisplay {
     main_progress_bar: Option<ProgressBar>,
     worker_bars: Vec<Option<ProgressBar>>,
     verbose: bool,
+    /// Cached GPU load percentage (updated periodically)
+    last_gpu_load: Option<u32>,
+    /// Cached CPU load percentage (updated periodically)
+    last_cpu_load: f32,
+    /// System info for CPU queries
+    sys: System,
+    /// Counter for throttling system queries
+    sys_query_counter: u32,
 }
 
 impl ProgressDisplay {
@@ -1016,10 +1024,21 @@ impl ProgressDisplay {
             main_progress_bar,
             worker_bars,
             verbose,
+            last_gpu_load: None,
+            last_cpu_load: 0.0,
+            sys: System::new_with_specifics(RefreshKind::new().with_cpu(CpuRefreshKind::everything())),
+            sys_query_counter: 0,
         }
     }
 
     pub fn update(&mut self, stats: &TestStats, _files_completed: usize, batches_running: usize, _batches_remaining: usize, has_pending_batches: bool, eta_seconds: Option<f64>, worker_states: Option<&WorkerStates>) {
+        // Update CPU/GPU load every ~30 updates (~500ms at 16ms refresh rate)
+        self.sys_query_counter += 1;
+        if self.sys_query_counter >= 30 {
+            self.sys_query_counter = 0;
+            self.last_cpu_load = get_cpu_usage(&mut self.sys);
+            self.last_gpu_load = get_gpu_usage();
+        }
         let passed = stats.passed.load(Ordering::SeqCst);
         let failed = stats.failed.load(Ordering::SeqCst);
         let ignored = stats.ignored.load(Ordering::SeqCst);
@@ -1087,11 +1106,17 @@ impl ProgressDisplay {
                 " \x1b[2m[no timer]\x1b[0m".to_string()
             };
 
+            let load_info = match self.last_gpu_load {
+                Some(gpu) => format!(" | CPU: {:.0}% GPU: {}%", self.last_cpu_load, gpu),
+                None if self.last_cpu_load > 0.0 => format!(" | CPU: {:.0}%", self.last_cpu_load),
+                None => String::new(),
+            };
+
             let msg = format!(
-                "[{}/{}/{}] {:.1}% | {} passed, {} failed, {} ignored | Elapsed: {:.1}s{}{}{}",
+                "[{}/{}/{}] {:.1}% | {} passed, {} failed, {} ignored | Elapsed: {:.1}s{}{}{}{}",
                 batches_running, tests_remaining, self.total_files,
                 percent, passed, failed, ignored, elapsed,
-                eta, compiling_info, stuck_info
+                eta, load_info, compiling_info, stuck_info
             );
             pb.set_message(msg);
 
@@ -1205,27 +1230,22 @@ impl Default for SystemStats {
     }
 }
 
+#[cfg(feature = "gpu-info")]
 fn get_gpu_usage() -> Option<u32> {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(output) = std::process::Command::new("nvidia-smi")
-            .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
-            .output()
-        {
-            if output.status.success() {
-                if let Ok(s) = String::from_utf8(output.stdout) {
-                    return s.lines()
-                        .filter_map(|line| line.trim().parse::<u32>().ok())
-                        .max();
-                }
-            }
-        }
-        None
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    let gpu = gfxinfo::active_gpu().ok()?;
+    let info = gpu.info();
+    Some(info.load_pct())
+}
+
+#[cfg(not(feature = "gpu-info"))]
+fn get_gpu_usage() -> Option<u32> {
+    None
+}
+
+fn get_cpu_usage(sys: &mut System) -> f32 {
+    sys.refresh_cpu_all();
+    sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>()
+        / sys.cpus().len().max(1) as f32
 }
 
 
