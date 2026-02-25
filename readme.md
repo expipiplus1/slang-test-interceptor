@@ -73,11 +73,12 @@ sti -g 4
 
 - `--retries <N>` - Number of retries for failed tests (default: 2).
 - `--hide-ignored` - Hide ignored tests from output
-- `--batch-size <N>` - Maximum tests per slang-test invocation (default: 100)
-- `--batch-duration <SECS>` - Target batch duration in seconds when timing data is available (default: 10.0)
+- `--batch-size <N>` - Maximum tests per slang-test invocation (default: auto-calculated as `(num_tests/jobs)*3`)
+- `--batch-duration <SECS>` - Target batch duration in seconds when timing data is available (default: auto-calculated as `predicted_runtime/2`, minimum 1.0)
 - `--no-timing-cache` - Ignore cached timing data for scheduling and ETA
 - `--event-log <PATH>` - Write CSV event log for performance debugging
 - `--timeout <SECS>` - Timeout per test batch in seconds (default: 600 = 10 minutes)
+- `--gpu-stagger <MS>` - GPU stagger increment in milliseconds (default: 100). The first N batches (N = jobs) have increasing amounts of CPU work at the start to stagger GPU test launches, reducing Vulkan context creation contention.
 
 When stderr is not a TTY (e.g., in CI or when piped), output automatically switches to machine-readable format: no carriage returns, no terminal clearing, sparse progress updates.
 
@@ -89,14 +90,14 @@ During execution, a progress line updates in place showing:
 [32/7786/7885] 0.0% | 0 passed, 0 failed, 0 ignored | Elapsed: 0.5s | ETA: 42.7s
 ```
 
-- `[running/remaining/total]` - batches running, batches remaining, total tests
+- `[running/remaining/total]` - batches running, tests remaining in queue, total tests
 - Test counts (passed, failed, ignored)
 - Elapsed time and ETA
 
 When stderr is not a TTY (CI, piped output), progress is printed on separate lines at 10% intervals:
 
 ```
-[467/3112] 131 passed, 0 failed, 336 ignored (7.5s) [24/98]
+[32/7786/7885] 0.0% | 0 passed, 0 failed, 0 ignored | Elapsed: 0.5s | ETA: 42.7s
 ```
 
 At completion, a summary shows:
@@ -216,9 +217,9 @@ Pressing Ctrl-C gracefully interrupts the test run:
 
 Instead of pre-creating batches, the runner uses a dynamic work pool that workers pull from:
 
-1. **Duration-based batching**: When timing data is available, batches target a duration (default 10s via `--batch-duration`) rather than a fixed file count. This balances startup overhead against batch size. Without timing data, random batches up to `--batch-size` are used.
+1. **Duration-based batching**: When timing data is available, batches target a duration (via `--batch-duration`, auto-calculated by default) rather than a fixed file count. This balances startup overhead against batch size. Without timing data, random batches up to `--batch-size` are used.
 
-2. **Slow-first scheduling**: Files are sorted by predicted duration (longest first) and workers preferentially pick slower files. This prevents the "long tail" problem where one worker is stuck on slow tests at the end.
+2. **Constrained random shuffle**: Tests are randomly placed, but each test is constrained so it can't become the "long pole" at the end. For a test predicted to take X seconds with total run time Y, it's placed randomly in the first `(Y-X)/Y` fraction of the schedule. This prevents slow tests from clustering at the end while maintaining randomness to avoid GPU contention.
 
 3. **Retry integration**: Failed tests go back into the same pool, automatically getting picked up by available workers.
 
@@ -238,7 +239,7 @@ The runner maintains a cache of test execution times to optimize scheduling:
 
 3. **Cache storage**: After each run, timing data is saved to the state directory (see below)
 
-4. **LPT scheduling**: On subsequent runs, files are sorted by predicted duration (longest first). This ensures slow tests start early and run concurrently with faster tests, preventing the "long tail" problem where all workers finish except one stuck on slow tests.
+4. **Constrained random scheduling**: On subsequent runs, tests are randomly shuffled but constrained so slow tests can't end up at the very end. This prevents the "long tail" problem while maintaining randomness to avoid GPU contention from clustering similar tests together.
 
 ### State location
 
