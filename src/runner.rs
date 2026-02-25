@@ -1386,8 +1386,8 @@ impl TestRunner {
         };
         let effective_batch_size = if self.args.batch_size == 0 {
             if has_timing_data {
-                // With timing data, allow larger batches (3x tests per worker)
-                ((test_files.len() / self.args.jobs) * 3).max(1)
+                // With timing data: 2x tests per worker
+                ((test_files.len() / self.args.jobs) * 2).max(1)
             } else {
                 // Without timing data, be conservative: max 50, never more than 1/nworkers
                 50.min(test_files.len() / self.args.jobs).max(1)

@@ -1607,12 +1607,12 @@ impl ProgressDisplay {
                 self.last_reported_files.store(new_marker, Ordering::SeqCst);
                 let percent = (tests_done as f64 / self.total_files.max(1) as f64) * 100.0;
                 let eta = match adjusted_eta {
-                    Some(secs) if secs > 1.0 => format!(" | ETA: {:.1}s", secs),
-                    Some(_) => " | ETA: <1s".to_string(),
+                    Some(secs) if secs > 1.0 => format!(" \x1b[2m|\x1b[0m ETA: {:.1}s", secs),
+                    Some(_) => " \x1b[2m|\x1b[0m ETA: <1s".to_string(),
                     None => String::new(),
                 };
                 eprintln!(
-                    "[{}/{}/{}] {:.1}% | {} passed, {} failed, {} ignored | Elapsed: {:.1}s{}",
+                    "[{}/{}/{}] {:.1}% \x1b[2m|\x1b[0m {} passed, {} failed, {} ignored \x1b[2m|\x1b[0m Elapsed: {:.1}s{}",
                     batches_running, tests_remaining, self.total_files,
                     percent, passed, failed, ignored, elapsed, eta
                 );
@@ -1709,7 +1709,7 @@ impl ProgressDisplay {
             let ignored = stats.ignored.load(Ordering::SeqCst);
             let elapsed = self.start_time.elapsed().as_secs_f64();
             eprintln!(
-                "[0/0/{}] 100.0% | {} passed, {} failed, {} ignored | Elapsed: {:.1}s |",
+                "[0/0/{}] 100.0% \x1b[2m|\x1b[0m {} passed, {} failed, {} ignored \x1b[2m|\x1b[0m Elapsed: {:.1}s \x1b[2m|\x1b[0m",
                 self.total_files, passed, failed, ignored, elapsed
             );
         }
