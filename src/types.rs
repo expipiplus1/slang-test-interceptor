@@ -1,4 +1,4 @@
-use colored::Colorize;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use sysinfo::{CpuRefreshKind, RefreshKind, System};
 use std::collections::{HashMap, HashSet};
@@ -484,11 +484,12 @@ pub struct FailureInfo {
 // Work Pool
 // ============================================================================
 
-/// Tracks an in-flight batch: when it started and its predicted duration
+/// Tracks an in-flight batch: when it started, its predicted duration, and test count
 #[derive(Clone)]
 struct InFlightBatch {
     start_time: Instant,
     predicted_duration: f64,
+    test_count: usize,
 }
 
 pub struct WorkPool {
@@ -628,11 +629,14 @@ impl WorkPool {
             && self.in_flight.lock().unwrap().is_empty()
     }
 
-    /// Returns number of tests in pool (not including in-flight)
+    /// Returns number of tests remaining (in pool + in-flight)
     pub fn remaining(&self) -> usize {
         let batches = self.batches.lock().unwrap();
         let pending = self.pending_files.lock().unwrap();
-        batches.iter().map(|b| b.len()).sum::<usize>() + pending.len()
+        let in_flight = self.in_flight.lock().unwrap();
+        let pool_count: usize = batches.iter().map(|b| b.len()).sum::<usize>() + pending.len();
+        let in_flight_count: usize = in_flight.values().map(|b| b.test_count).sum();
+        pool_count + in_flight_count
     }
 
     /// Get the next batch of tests to run.
@@ -681,9 +685,11 @@ impl WorkPool {
 
         // Track as in-flight
         let batch_id = self.next_batch_id.fetch_add(1, Ordering::SeqCst);
+        let test_count = batch.len();
         self.in_flight.lock().unwrap().insert(batch_id, InFlightBatch {
             start_time: Instant::now(),
             predicted_duration,
+            test_count,
         });
 
         Some((batch_id, batch))
@@ -728,47 +734,79 @@ pub struct ProgressDisplay {
     start_time: Instant,
     machine_output: bool,
     last_reported_files: AtomicUsize,
+    progress_bar: Option<ProgressBar>,
 }
 
 impl ProgressDisplay {
     pub fn new(total_files: usize, machine_output: bool) -> Self {
+        let progress_bar = if machine_output {
+            None
+        } else {
+            let pb = ProgressBar::new(total_files as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{msg}")
+                    .unwrap(),
+            );
+            Some(pb)
+        };
+
         Self {
             total_files,
             start_time: Instant::now(),
             machine_output,
             last_reported_files: AtomicUsize::new(0),
+            progress_bar,
         }
     }
 
-    pub fn update(&self, stats: &TestStats, files_completed: usize, batches_running: usize, batches_remaining: usize, eta_seconds: Option<f64>) {
+    pub fn update(&self, stats: &TestStats, _files_completed: usize, batches_running: usize, _batches_remaining: usize, eta_seconds: Option<f64>) {
         let passed = stats.passed.load(Ordering::SeqCst);
         let failed = stats.failed.load(Ordering::SeqCst);
         let ignored = stats.ignored.load(Ordering::SeqCst);
-        let _total_tests = passed + failed + ignored;
+        let tests_done = passed + failed + ignored;
+        let tests_remaining = self.total_files.saturating_sub(tests_done);
         let elapsed = self.start_time.elapsed().as_secs_f64();
 
         if self.machine_output {
-            let last_files = self.last_reported_files.load(Ordering::SeqCst);
-            let report_interval = (self.total_files / 10).max(1);
-            if files_completed >= last_files + report_interval {
-                self.last_reported_files.store(files_completed, Ordering::SeqCst);
+            // Report at 0%, 10%, 20%, ... 90%, 99%, 100%
+            // last_reported_files stores (last_pct + 1) so 0 means "haven't reported yet"
+            // We use 0-10 for 0%-100% in 10% steps, and 99 as a special marker for 99%
+            let current_pct = (tests_done * 10) / self.total_files.max(1);
+            let at_99_pct = tests_done * 100 >= self.total_files * 99 && tests_done < self.total_files;
+            let last_reported = self.last_reported_files.load(Ordering::SeqCst);
+            let should_report = if last_reported == 0 {
+                true  // First report (0%)
+            } else if at_99_pct && last_reported < 99 {
+                true  // Report at 99%
+            } else {
+                current_pct >= last_reported && last_reported <= 10  // Next 10% threshold
+            };
+            if should_report {
+                let new_marker = if at_99_pct { 99 } else { current_pct + 1 };
+                self.last_reported_files.store(new_marker, Ordering::SeqCst);
+                let percent = (tests_done as f64 / self.total_files.max(1) as f64) * 100.0;
+                let eta = match eta_seconds {
+                    Some(secs) if secs > 1.0 => format!(" ETA: {:.1}s", secs),
+                    Some(_) => " ETA: <1s".to_string(),
+                    None => String::new(),
+                };
                 eprintln!(
-                    "[{}/{}] {} passed, {} failed, {} ignored ({:.1}s) [{}/{}]",
-                    files_completed, self.total_files, passed, failed, ignored, elapsed,
-                    batches_running, batches_remaining
+                    "[{}/{}/{}] {:.1}% | {} passed, {} failed, {} ignored | Elapsed: {:.1}s |{}",
+                    batches_running, tests_remaining, self.total_files,
+                    percent, passed, failed, ignored, elapsed, eta
                 );
             }
-        } else {
+        } else if let Some(ref pb) = self.progress_bar {
             // Percentage based on tests completed vs total
-            let tests_done = passed + failed + ignored;
             let percent = (tests_done as f64 / self.total_files.max(1) as f64) * 100.0;
 
             // Format ETA string
             let eta = match eta_seconds {
-                Some(secs) if secs > 1.0 && files_completed < self.total_files => {
+                Some(secs) if secs > 1.0 && tests_remaining > 0 => {
                     format!(" ETA: {:.1}s", secs)
                 }
-                Some(_) if files_completed < self.total_files => {
+                Some(_) if tests_remaining > 0 => {
                     " ETA: <1s".to_string()
                 }
                 _ => String::new(),
@@ -782,20 +820,37 @@ impl ProgressDisplay {
 
             let stuck_info = if let Some(secs) = stats.seconds_since_last_output() {
                 if secs > 1.0 {
-                    format!(" {}", format!("[waiting {:.0}s]", secs).dimmed())
+                    format!(" \x1b[2m[waiting {:.0}s]\x1b[0m", secs)
                 } else {
                     String::new()
                 }
             } else {
-                format!(" \x1b[2m[no timer]\x1b[0m")
+                " \x1b[2m[no timer]\x1b[0m".to_string()
             };
 
-            eprint!(
-                "\r\x1b[K[{}/{}/{}] {:.1}% | {}/{}/{} passed/failed/ignored | Elapsed: {:.1}s |{}{}{}",
-                batches_running, batches_remaining, self.total_files, percent, passed, failed, ignored, elapsed, eta,
-                compiling_info, stuck_info
+            let msg = format!(
+                "[{}/{}/{}] {:.1}% | {} passed, {} failed, {} ignored | Elapsed: {:.1}s |{}{}{}",
+                batches_running, tests_remaining, self.total_files,
+                percent, passed, failed, ignored, elapsed,
+                eta, compiling_info, stuck_info
             );
-            let _ = std::io::stderr().flush();
+            pb.set_message(msg);
+        }
+    }
+
+    pub fn finish(&self, stats: &TestStats) {
+        if let Some(ref pb) = self.progress_bar {
+            pb.finish_and_clear();
+        } else if self.machine_output {
+            // Print final 100% status in machine mode
+            let passed = stats.passed.load(Ordering::SeqCst);
+            let failed = stats.failed.load(Ordering::SeqCst);
+            let ignored = stats.ignored.load(Ordering::SeqCst);
+            let elapsed = self.start_time.elapsed().as_secs_f64();
+            eprintln!(
+                "[0/0/{}] 100.0% | {} passed, {} failed, {} ignored | Elapsed: {:.1}s |",
+                self.total_files, passed, failed, ignored, elapsed
+            );
         }
     }
 }

@@ -1,8 +1,9 @@
 use anyhow::Result;
 use colored::Colorize;
+use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -878,17 +879,32 @@ impl TestRunner {
         let mut total_predicted: f64 = 0.0;
         let mut longest_test: f64 = 0.0;
 
+        // Create discovery progress bar (TTY mode only)
+        let discovery_pb = if self.machine_output {
+            None
+        } else {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{msg}")
+                    .unwrap(),
+            );
+            Some(pb)
+        };
+
         loop {
             // Check for errors from the discovery thread
             if let Ok(error_msg) = error_rx.try_recv() {
+                if let Some(ref pb) = discovery_pb {
+                    pb.finish_and_clear();
+                }
                 anyhow::bail!("{}", error_msg);
             }
 
             // Check for compiling signal
             if !shown_compiling && compiling_rx.try_recv().is_ok() {
-                if !self.machine_output {
-                    eprint!("\x1b[2mCompiling core module...\x1b[0m");
-                    let _ = std::io::stderr().flush();
+                if let Some(ref pb) = discovery_pb {
+                    pb.set_message("\x1b[2mCompiling core module...\x1b[0m".to_string());
                 }
                 shown_compiling = true;
             }
@@ -921,15 +937,14 @@ impl TestRunner {
                     test_files.push(test);
 
                     // Update progress display (only in TTY mode)
-                    if !self.machine_output {
+                    if let Some(ref pb) = discovery_pb {
                         let eta = if cache_for_display.is_some() {
                             let parallel_eta = total_predicted / self.args.jobs as f64;
                             Some(parallel_eta.max(longest_test))
                         } else {
                             None
                         };
-                        eprint!("\r\x1b[K{}", format_running_message(test_files.len(), self.args.jobs, eta));
-                        let _ = std::io::stderr().flush();
+                        pb.set_message(format_running_message(test_files.len(), self.args.jobs, eta));
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -938,6 +953,9 @@ impl TestRunner {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     // Channel closed - check for errors one more time
                     if let Ok(error_msg) = error_rx.try_recv() {
+                        if let Some(ref pb) = discovery_pb {
+                            pb.finish_and_clear();
+                        }
                         anyhow::bail!("{}", error_msg);
                     }
                     break;
@@ -945,14 +963,11 @@ impl TestRunner {
             }
         }
 
-        // Clear the discovery line
-        if !self.machine_output && !test_files.is_empty() {
-            eprint!("\r\x1b[K");
-            let _ = std::io::stderr().flush();
-        }
-
         // Check for errors after discovery completes
         if let Ok(error_msg) = error_rx.try_recv() {
+            if let Some(pb) = discovery_pb {
+                pb.finish_and_clear();
+            }
             anyhow::bail!("{}", error_msg);
         }
 
@@ -970,8 +985,14 @@ impl TestRunner {
         test_files.sort();
 
         if test_files.is_empty() {
+            if let Some(pb) = discovery_pb {
+                pb.finish_and_clear();
+            }
             eprintln!("No tests found matching the specified criteria");
         } else if self.args.dry_run {
+            if let Some(pb) = discovery_pb {
+                pb.finish_and_clear();
+            }
             // Just print the tests that would be run
             for test in &test_files {
                 println!("{}", test);
@@ -979,7 +1000,7 @@ impl TestRunner {
             eprintln!("{} tests would be run", test_files.len());
             return Ok(true);
         } else {
-            self.run_file_tests(&test_files)?;
+            self.run_file_tests(&test_files, discovery_pb)?;
         }
 
         let elapsed = start_time.elapsed();
@@ -993,8 +1014,11 @@ impl TestRunner {
         Ok(self.stats.failed.load(Ordering::SeqCst) == 0 && !is_interrupted())
     }
 
-    fn run_file_tests(&self, test_files: &[String]) -> Result<()> {
+    fn run_file_tests(&self, test_files: &[String], discovery_pb: Option<ProgressBar>) -> Result<()> {
         if test_files.is_empty() {
+            if let Some(pb) = discovery_pb {
+                pb.finish_and_clear();
+            }
             return Ok(());
         }
 
@@ -1051,7 +1075,13 @@ impl TestRunner {
         } else {
             None
         };
-        eprintln!("{}", format_running_message(test_files.len(), self.args.jobs, eta));
+        let running_msg = format_running_message(test_files.len(), self.args.jobs, eta);
+        if let Some(pb) = discovery_pb {
+            pb.finish_with_message(running_msg);
+        } else {
+            // Machine output mode
+            eprintln!("{}", running_msg);
+        }
 
         let work_pool = Arc::new(WorkPool::new(
             sorted_files,
@@ -1086,6 +1116,7 @@ impl TestRunner {
         let progress_shutdown_clone = progress_shutdown.clone();
         let total_files = test_files.len();
         let machine_output = self.machine_output;
+        let num_workers = self.args.jobs;
         let progress_handle = thread::spawn(move || {
             let display = ProgressDisplay::new(total_files, machine_output);
             // Initialize SystemStats lazily to avoid blocking the first progress update
@@ -1096,7 +1127,7 @@ impl TestRunner {
                 let batches_running = progress_running.load(Ordering::SeqCst);
                 let batches_remaining = progress_pool.remaining();
                 let eta = if progress_pool.has_timing_data {
-                    Some(progress_pool.calculate_eta(batches_running))
+                    Some(progress_pool.calculate_eta(num_workers))
                 } else {
                     None
                 };
@@ -1111,6 +1142,7 @@ impl TestRunner {
 
                 thread::sleep(Duration::from_millis(100));
             }
+            display.finish(&progress_stats);
         });
 
         debug_log!("progress thread spawned, about to spawn workers");
@@ -1187,10 +1219,6 @@ impl TestRunner {
 
             progress_shutdown.store(true, Ordering::SeqCst);
             let _ = progress_handle.join();
-            if !self.machine_output {
-                eprint!("\r\x1b[K");
-                let _ = std::io::stderr().flush();
-            }
         }
 
         Ok(())
