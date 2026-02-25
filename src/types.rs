@@ -738,33 +738,6 @@ impl WorkPool {
 /// Sentinel value meaning "no test running" (worker is idle or between batches)
 pub const WORKER_IDLE: usize = usize::MAX;
 
-/// What a worker is currently doing
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerStatus {
-    /// Sleeping between batches
-    Idle,
-    /// Trying to get a batch from the pool
-    FetchingBatch,
-    /// Launching slang-test process
-    Starting,
-    /// Running tests (index into current batch)
-    Running,
-    /// Finishing batch (joining threads, handling results)
-    Finishing,
-}
-
-impl std::fmt::Display for WorkerStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WorkerStatus::Idle => write!(f, "idle"),
-            WorkerStatus::FetchingBatch => write!(f, "fetching batch"),
-            WorkerStatus::Starting => write!(f, "starting"),
-            WorkerStatus::Running => write!(f, "running"),
-            WorkerStatus::Finishing => write!(f, "finishing"),
-        }
-    }
-}
-
 /// State for a single worker, used to track what test is currently running.
 /// The worker writes to this, and the progress thread reads from it.
 pub struct WorkerState {
@@ -772,8 +745,6 @@ pub struct WorkerState {
     pub current_test_idx: AtomicUsize,
     /// The current batch of tests (set when batch starts, cleared when batch ends)
     pub current_batch: Mutex<Vec<String>>,
-    /// Current status of the worker
-    pub status: AtomicUsize,
 }
 
 impl WorkerState {
@@ -781,24 +752,6 @@ impl WorkerState {
         Self {
             current_test_idx: AtomicUsize::new(WORKER_IDLE),
             current_batch: Mutex::new(Vec::new()),
-            status: AtomicUsize::new(WorkerStatus::Idle as usize),
-        }
-    }
-
-    /// Set the worker's status
-    pub fn set_status(&self, status: WorkerStatus) {
-        self.status.store(status as usize, Ordering::SeqCst);
-    }
-
-    /// Get the worker's current status
-    pub fn get_status(&self) -> WorkerStatus {
-        match self.status.load(Ordering::SeqCst) {
-            0 => WorkerStatus::Idle,
-            1 => WorkerStatus::FetchingBatch,
-            2 => WorkerStatus::Starting,
-            3 => WorkerStatus::Running,
-            4 => WorkerStatus::Finishing,
-            _ => WorkerStatus::Idle,
         }
     }
 
@@ -806,7 +759,6 @@ impl WorkerState {
     pub fn start_batch(&self, batch: &[String]) {
         *self.current_batch.lock().unwrap() = batch.to_vec();
         self.current_test_idx.store(0, Ordering::SeqCst);
-        self.set_status(WorkerStatus::Running);
     }
 
     /// Called when a test completes - advance to next test
@@ -818,7 +770,6 @@ impl WorkerState {
     pub fn clear(&self) {
         self.current_test_idx.store(WORKER_IDLE, Ordering::SeqCst);
         self.current_batch.lock().unwrap().clear();
-        self.set_status(WorkerStatus::Idle);
     }
 
     /// Get the currently running test name, if any
@@ -948,12 +899,12 @@ impl ProgressDisplay {
                 self.last_reported_files.store(new_marker, Ordering::SeqCst);
                 let percent = (tests_done as f64 / self.total_files.max(1) as f64) * 100.0;
                 let eta = match eta_seconds {
-                    Some(secs) if secs > 1.0 => format!(" ETA: {:.1}s", secs),
-                    Some(_) => " ETA: <1s".to_string(),
+                    Some(secs) if secs > 1.0 => format!(" | ETA: {:.1}s", secs),
+                    Some(_) => " | ETA: <1s".to_string(),
                     None => String::new(),
                 };
                 eprintln!(
-                    "[{}/{}/{}] {:.1}% | {} passed, {} failed, {} ignored | Elapsed: {:.1}s |{}",
+                    "[{}/{}/{}] {:.1}% | {} passed, {} failed, {} ignored | Elapsed: {:.1}s{}",
                     batches_running, tests_remaining, self.total_files,
                     percent, passed, failed, ignored, elapsed, eta
                 );
@@ -965,10 +916,10 @@ impl ProgressDisplay {
             // Format ETA string
             let eta = match eta_seconds {
                 Some(secs) if secs > 1.0 && tests_remaining > 0 => {
-                    format!(" ETA: {:.1}s", secs)
+                    format!(" | ETA: {:.1}s", secs)
                 }
                 Some(_) if tests_remaining > 0 => {
-                    " ETA: <1s".to_string()
+                    " | ETA: <1s".to_string()
                 }
                 _ => String::new(),
             };
@@ -990,7 +941,7 @@ impl ProgressDisplay {
             };
 
             let msg = format!(
-                "[{}/{}/{}] {:.1}% | {} passed, {} failed, {} ignored | Elapsed: {:.1}s |{}{}{}",
+                "[{}/{}/{}] {:.1}% | {} passed, {} failed, {} ignored | Elapsed: {:.1}s{}{}{}",
                 batches_running, tests_remaining, self.total_files,
                 percent, passed, failed, ignored, elapsed,
                 eta, compiling_info, stuck_info
@@ -1013,9 +964,8 @@ impl ProgressDisplay {
                                 worker_bar.finish_and_clear();
                                 *worker_bar_opt = None;
                             } else {
-                                // Worker is between tests - show status
-                                let status = state.get_status();
-                                worker_bar.set_message(format!("  worker {}: ({})", worker_id, status));
+                                // Worker is between tests
+                                worker_bar.set_message(format!("  worker {}:", worker_id));
                             }
                         }
                     }

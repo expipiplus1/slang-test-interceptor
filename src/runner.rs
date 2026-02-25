@@ -11,7 +11,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::types::{*, TestId, test_to_timing_key, WorkerState, WorkerStates, WorkerStatus};
+use crate::types::{*, TestId, test_to_timing_key, WorkerState, WorkerStates};
 
 // ============================================================================
 // Debug Logging
@@ -1200,9 +1200,6 @@ impl TestRunner {
                             break;
                         }
 
-                        if let Some(state) = my_state {
-                            state.set_status(WorkerStatus::FetchingBatch);
-                        }
                         let get_batch_start = Instant::now();
                         if let Some((batch_id, batch)) = pool.try_get_batch() {
                             let get_batch_time = get_batch_start.elapsed();
@@ -1228,9 +1225,6 @@ impl TestRunner {
                             );
                             pool.complete_batch(batch_id);
                         } else {
-                            if let Some(state) = my_state {
-                                state.set_status(WorkerStatus::Idle);
-                            }
                             thread::sleep(Duration::from_millis(10));
                         }
                     }
