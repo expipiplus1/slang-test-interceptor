@@ -2,6 +2,7 @@ use anyhow::Result;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::seq::SliceRandom;
+use rand::Rng;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -1180,12 +1181,45 @@ impl TestRunner {
                 .collect()
         };
 
-        // Pure random shuffle to spread GPU tests evenly and avoid contention.
-        // We rely on:
-        // - Slow batch staggering (limits concurrent slow batches)
-        // - Tail prioritization (picks slowest batch when few remain)
-        // Biased shuffle was tried but caused clustering → worse GPU contention.
-        let sorted_files: Vec<String> = {
+        // Constrained random shuffle: each test is randomly placed, but constrained
+        // so it can't become the "long pole" at the end.
+        //
+        // For a test predicted to take X seconds with total run time Y:
+        // - Latest valid position = (Y - X) / Y (as fraction of schedule)
+        // - Test is placed randomly in [0, latest_valid_position]
+        //
+        // This ensures slow tests finish before the run would otherwise complete,
+        // while maintaining randomness to avoid GPU contention from clustering.
+        let sorted_files: Vec<String> = if has_timing_data {
+            let mut rng = rand::thread_rng();
+            let total_predicted: f64 = predictions.values().sum();
+            let n = test_files.len();
+
+            if total_predicted > 0.0 && n > 0 {
+                // For each test, calculate random position within its valid range
+                let mut files_with_pos: Vec<_> = test_files.iter()
+                    .map(|f| {
+                        let dur = predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                        // Latest position where this test won't be a long pole
+                        // (total - dur) / total, but at least 0.5 to avoid over-constraining
+                        let latest = ((total_predicted - dur) / total_predicted).max(0.5);
+                        // Random position in [0, latest]
+                        let position = rng.gen_range(0.0..=latest);
+                        (f.clone(), position)
+                    })
+                    .collect();
+
+                // Sort by position
+                files_with_pos.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                files_with_pos.into_iter().map(|(f, _)| f).collect()
+            } else {
+                // Fallback to pure random
+                let mut files = test_files.to_vec();
+                files.shuffle(&mut rng);
+                files
+            }
+        } else {
+            // No timing data - pure random shuffle
             let mut files = test_files.to_vec();
             files.shuffle(&mut rand::thread_rng());
             files
