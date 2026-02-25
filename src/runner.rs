@@ -338,6 +338,7 @@ fn collect_failure_output(failed_outcomes: &mut [TestOutcome], stderr_lines: &[S
 
 pub fn run_batch_with_pool(
     slang_test: &PathBuf,
+    root_dir: &PathBuf,
     test_files: &[String],
     extra_args: &[String],
     timeout: Duration,
@@ -352,6 +353,7 @@ pub fn run_batch_with_pool(
 ) {
     let ctx = BatchContext {
         slang_test,
+        root_dir,
         test_files,
         extra_args,
         timeout,
@@ -422,7 +424,8 @@ pub fn run_batch_with_pool(
         .collect();
 
     let mut cmd = Command::new(ctx.slang_test);
-    cmd.arg("-explicit-test-order")
+    cmd.current_dir(ctx.root_dir)
+        .arg("-explicit-test-order")
         .arg("-disable-retries")
         .args(&slang_test_args)
         .args(ctx.extra_args)
@@ -478,10 +481,9 @@ pub fn run_batch_with_pool(
                 if let Some(mut outcome) = parse_test_output(&line) {
                     let now = Instant::now();
 
-                    let should_record_timing = last_test_time.is_some()
-                        && outcome.result != TestResult::Ignored;
-
-                    let test_duration = if should_record_timing {
+                    // Record timing for all test results (passed, failed, ignored)
+                    // since they all contribute to overall runtime
+                    let test_duration = if last_test_time.is_some() {
                         outcome.duration
                             .map(|d| d.as_secs_f64())
                             .unwrap_or_else(|| last_test_time.unwrap().elapsed().as_secs_f64())
@@ -489,7 +491,7 @@ pub fn run_batch_with_pool(
                         0.0
                     };
 
-                    if outcome.duration.is_none() && should_record_timing {
+                    if outcome.duration.is_none() && last_test_time.is_some() {
                         outcome.duration = Some(Duration::from_secs_f64(test_duration));
                     }
 
@@ -500,7 +502,7 @@ pub fn run_batch_with_pool(
                     let test_id = TestId::parse(&outcome.name);
                     let timing_key = test_id.to_timing_key();
 
-                    if should_record_timing {
+                    if test_duration > 0.0 {
                         let _ = timing_tx.send((timing_key.clone(), test_duration));
                     }
 
@@ -734,6 +736,12 @@ pub fn run_batch_with_pool(
                 expected: None,
                 actual: None,
             });
+
+            // Record timing for crashed/timed-out test using actual elapsed time
+            // This helps scheduling know this test is slow/problematic
+            let test_id = TestId::parse(&test);
+            let timing_key = test_id.to_timing_key();
+            ctx.stats.record_observed_timing(&timing_key, loop_time.as_secs_f64());
         }
     }
 
@@ -756,11 +764,15 @@ pub struct TestRunner {
     pub retried_tests: Arc<Mutex<HashMap<String, usize>>>,
     pub machine_output: bool,
     pub timing_cache: Mutex<TimingCache>,
+    pub build_type: Option<BuildType>,
 }
 
 impl TestRunner {
     pub fn new(args: crate::Args) -> Self {
         let machine_output = !crate::is_stderr_tty();
+        // Detect build type from slang-test path
+        let build_type = args.slang_test.as_ref()
+            .and_then(|p| BuildType::from_path(p));
         // Don't load timing cache yet - will be loaded concurrently with discovery
         Self {
             args,
@@ -769,14 +781,19 @@ impl TestRunner {
             retried_tests: Arc::new(Mutex::new(HashMap::new())),
             machine_output,
             timing_cache: Mutex::new(TimingCache::default()),
+            build_type,
         }
     }
 
     pub fn save_timing(&self) {
+        // Only save if we have a known build type
+        let Some(build_type) = self.build_type else {
+            return;
+        };
         let observed = self.stats.get_observed_timings();
         if !observed.is_empty() {
             let mut cache = self.timing_cache.lock().unwrap();
-            cache.merge(&observed);
+            cache.merge(build_type, &observed);
             cache.save();
         }
     }
@@ -785,7 +802,8 @@ impl TestRunner {
         let start_time = Instant::now();
 
         // Load timing cache concurrently with test discovery (via channel)
-        let load_cache = !self.args.no_timing_cache;
+        let load_cache = !self.args.no_timing_cache && self.build_type.is_some();
+        let build_type = self.build_type;
         let (cache_tx, cache_rx) = crossbeam_channel::bounded::<TimingCache>(1);
         if load_cache {
             thread::spawn(move || {
@@ -818,16 +836,18 @@ impl TestRunner {
             if cache_for_display.is_none() {
                 if let Ok(cache) = cache_rx.try_recv() {
                     // Cache just loaded - compute predictions for all tests we've collected so far
-                    total_predicted = test_files.iter()
-                        .map(|f| cache.predict(&test_to_timing_key(f)))
-                        .sum();
+                    if let Some(bt) = build_type {
+                        total_predicted = test_files.iter()
+                            .map(|f| cache.predict(bt, &test_to_timing_key(f)))
+                            .sum();
+                    }
                     cache_for_display = Some(cache);
                 }
             }
 
             // Add prediction for this test incrementally (if cache is loaded)
-            if let Some(ref cache) = cache_for_display {
-                total_predicted += cache.predict(&test_to_timing_key(&test));
+            if let (Some(ref cache), Some(bt)) = (&cache_for_display, build_type) {
+                total_predicted += cache.predict(bt, &test_to_timing_key(&test));
             }
 
             test_files.push(test);
@@ -838,7 +858,7 @@ impl TestRunner {
                     // Show count with prediction
                     let eta = total_predicted / self.args.jobs as f64;
                     eprint!(
-                        "\r\x1b[KRunning {} tests with {} workers (predicted {:.0}s with cached timing)",
+                        "\r\x1b[KRunning {} tests with {} workers \x1b[2m(predicted {:.0}s)\x1b[0m",
                         test_files.len(),
                         self.args.jobs,
                         eta
@@ -908,19 +928,22 @@ impl TestRunner {
             return Ok(());
         }
 
-        let has_timing_data = !self.args.no_timing_cache && {
+        let has_timing_data = !self.args.no_timing_cache && self.build_type.is_some() && {
             let cache = self.timing_cache.lock().unwrap();
-            !cache.timings.is_empty()
+            self.build_type.map(|bt| cache.has_timing_data(bt)).unwrap_or(false)
         };
 
         // Build predictions map: test string -> predicted duration
         // We use the timing key (path + variant) for lookups but store by full test string
         let predictions: HashMap<String, f64> = {
             let cache = self.timing_cache.lock().unwrap();
+            let build_type = self.build_type;
             test_files.iter()
                 .map(|f| {
                     let timing_key = test_to_timing_key(f);
-                    let pred = cache.predict(&timing_key);
+                    let pred = build_type
+                        .map(|bt| cache.predict(bt, &timing_key))
+                        .unwrap_or(DEFAULT_PREDICTED_DURATION);
                     (f.clone(), pred)
                 })
                 .collect()
@@ -956,7 +979,7 @@ impl TestRunner {
         if has_timing_data {
             let total_predicted: f64 = predictions.values().sum();
             eprintln!(
-                "Running {} tests with {} workers (predicted {:.0}s with cached timing)",
+                "Running {} tests with {} workers \x1b[2m(predicted {:.0}s)\x1b[0m",
                 test_files.len(),
                 self.args.jobs,
                 total_predicted / self.args.jobs as f64
@@ -1029,6 +1052,7 @@ impl TestRunner {
         if !work_pool.is_empty() {
             for _ in 0..self.args.jobs {
                 let slang_test = self.args.slang_test.as_ref().unwrap().clone();
+                let root_dir = self.args.root_dir.clone();
                 let extra_args = self.args.extra_args.clone();
                 let stats = stats.clone();
                 let failures = failures.clone();
@@ -1048,6 +1072,7 @@ impl TestRunner {
                         if let Some(batch) = pool.try_get_batch() {
                             run_batch_with_pool(
                                 &slang_test,
+                                &root_dir,
                                 &batch,
                                 &extra_args,
                                 timeout,
@@ -1097,6 +1122,7 @@ impl TestRunner {
                         for _ in 0..extra_to_spawn {
                             if let Some(batch) = work_pool.try_get_medium_batch() {
                                 let slang_test = self.args.slang_test.as_ref().unwrap().clone();
+                                let root_dir = self.args.root_dir.clone();
                                 let extra_args = self.args.extra_args.clone();
                                 let stats = stats.clone();
                                 let failures = failures.clone();
@@ -1114,6 +1140,7 @@ impl TestRunner {
                                 let handle = thread::spawn(move || {
                                     run_batch_with_pool(
                                         &slang_test,
+                                        &root_dir,
                                         &batch,
                                         &extra_args,
                                         timeout,

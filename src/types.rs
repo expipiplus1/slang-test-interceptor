@@ -257,13 +257,53 @@ pub fn get_state_dir() -> Option<PathBuf> {
 // Timing Cache
 // ============================================================================
 
-/// Timing cache stores per-test durations.
+/// Build type for timing cache segmentation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildType {
+    Debug,
+    Release,
+    RelWithDebInfo,
+}
+
+impl BuildType {
+    /// Detect build type from slang-test path
+    pub fn from_path(path: &std::path::Path) -> Option<Self> {
+        let path_str = path.to_string_lossy().to_lowercase();
+        if path_str.contains("relwithdebinfo") {
+            Some(BuildType::RelWithDebInfo)
+        } else if path_str.contains("debug") {
+            Some(BuildType::Debug)
+        } else if path_str.contains("release") {
+            Some(BuildType::Release)
+        } else {
+            None
+        }
+    }
+}
+
+impl std::fmt::Display for BuildType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildType::Debug => write!(f, "debug"),
+            BuildType::Release => write!(f, "release"),
+            BuildType::RelWithDebInfo => write!(f, "relwithdebinfo"),
+        }
+    }
+}
+
+/// Timing cache stores per-test durations, segmented by build type.
 /// Keys are test identifiers like "tests/foo.slang" or "tests/foo.slang.4" (with variant suffix).
 /// The variant suffix is included when there are multiple tests from the same file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TimingCache {
     pub version: u32,
-    /// Map from test identifier (with optional variant suffix) to duration in seconds
+    /// Map from build type to (test identifier -> duration in seconds)
+    /// Using String keys for JSON serialization compatibility
+    #[serde(default)]
+    pub timings_by_build: HashMap<String, HashMap<String, f64>>,
+    /// Legacy: flat timings map (for migration from version 2)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub timings: HashMap<String, f64>,
 }
 
@@ -272,9 +312,15 @@ impl TimingCache {
         if let Some(state_dir) = get_state_dir() {
             let path = state_dir.join("timing.json");
             if let Ok(contents) = std::fs::read_to_string(&path) {
-                // Try to parse as new format (version 2)
-                if let Ok(cache) = serde_json::from_str::<TimingCache>(&contents) {
-                    if cache.version >= 2 {
+                if let Ok(mut cache) = serde_json::from_str::<TimingCache>(&contents) {
+                    // Migrate from version 2 (flat timings) to version 3 (segmented)
+                    if cache.version == 2 && !cache.timings.is_empty() {
+                        // Move old timings to "release" bucket as a reasonable default
+                        cache.timings_by_build.insert("release".to_string(), cache.timings.clone());
+                        cache.timings.clear();
+                        cache.version = 3;
+                    }
+                    if cache.version >= 3 {
                         return cache;
                     }
                 }
@@ -282,7 +328,8 @@ impl TimingCache {
             }
         }
         Self {
-            version: 2,
+            version: 3,
+            timings_by_build: HashMap::new(),
             timings: HashMap::new(),
         }
     }
@@ -297,9 +344,22 @@ impl TimingCache {
         }
     }
 
-    /// Record a test's duration. Uses EMA to smooth out variations.
-    pub fn record(&mut self, test_id: &str, duration: f64) {
-        let existing = self.timings.entry(test_id.to_string()).or_insert(0.0);
+    /// Get the timings map for a specific build type
+    fn get_timings(&self, build_type: BuildType) -> Option<&HashMap<String, f64>> {
+        self.timings_by_build.get(&build_type.to_string())
+    }
+
+    /// Get or create the timings map for a specific build type
+    fn get_timings_mut(&mut self, build_type: BuildType) -> &mut HashMap<String, f64> {
+        self.timings_by_build
+            .entry(build_type.to_string())
+            .or_insert_with(HashMap::new)
+    }
+
+    /// Record a test's duration for a specific build type. Uses EMA to smooth out variations.
+    pub fn record(&mut self, build_type: BuildType, test_id: &str, duration: f64) {
+        let timings = self.get_timings_mut(build_type);
+        let existing = timings.entry(test_id.to_string()).or_insert(0.0);
         if *existing == 0.0 {
             *existing = duration;
         } else {
@@ -307,15 +367,25 @@ impl TimingCache {
         }
     }
 
-    /// Predict duration for a test. Returns DEFAULT_PREDICTED_DURATION if unknown.
-    pub fn predict(&self, test_id: &str) -> f64 {
-        self.timings.get(test_id).copied().unwrap_or(DEFAULT_PREDICTED_DURATION)
+    /// Predict duration for a test with a specific build type.
+    /// Returns DEFAULT_PREDICTED_DURATION if unknown.
+    pub fn predict(&self, build_type: BuildType, test_id: &str) -> f64 {
+        self.get_timings(build_type)
+            .and_then(|t| t.get(test_id).copied())
+            .unwrap_or(DEFAULT_PREDICTED_DURATION)
     }
 
-    /// Merge observed timings into the cache
-    pub fn merge(&mut self, observed: &HashMap<String, f64>) {
+    /// Check if there's timing data for a specific build type
+    pub fn has_timing_data(&self, build_type: BuildType) -> bool {
+        self.get_timings(build_type)
+            .map(|t| !t.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Merge observed timings into the cache for a specific build type
+    pub fn merge(&mut self, build_type: BuildType, observed: &HashMap<String, f64>) {
         for (test_id, duration) in observed {
-            self.record(test_id, *duration);
+            self.record(build_type, test_id, *duration);
         }
     }
 }
@@ -639,7 +709,7 @@ impl ProgressDisplay {
 
             let stuck_info = if let Some(secs) = stats.seconds_since_last_output() {
                 if secs > 5.0 && batches_running > 0 {
-                    format!(" [no output {:.0}s]", secs)
+                    format!(" \x1b[2m[no output {:.0}s]\x1b[0m", secs)
                 } else {
                     String::new()
                 }
@@ -669,6 +739,7 @@ impl ProgressDisplay {
 
 pub struct BatchContext<'a> {
     pub slang_test: &'a PathBuf,
+    pub root_dir: &'a PathBuf,
     pub test_files: &'a [String],
     pub extra_args: &'a [String],
     pub timeout: Duration,

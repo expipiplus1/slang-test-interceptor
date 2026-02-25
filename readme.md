@@ -235,11 +235,13 @@ The runner maintains a cache of test execution times to optimize scheduling:
 
 1. **Per-test timing**: During execution, the runner tracks how long each test takes, broken down by backend (vk, cpu, llvm, etc.)
 
-2. **Cache storage**: After each run, timing data is saved to the state directory (see below)
+2. **Build-type segmentation**: Timing data is stored separately for debug, release, and relwithdebinfo builds. This ensures accurate predictions since debug builds are significantly slower than release builds.
 
-3. **LPT scheduling**: On subsequent runs, files are sorted by predicted duration (longest first). This ensures slow tests start early and run concurrently with faster tests, preventing the "long tail" problem where all workers finish except one stuck on slow tests.
+3. **Cache storage**: After each run, timing data is saved to the state directory (see below)
 
-4. **API-aware predictions**: When running with `-- -api vk`, only Vulkan backend timings are used for predictions. This prevents filtered runs from skewing estimates for full runs.
+4. **LPT scheduling**: On subsequent runs, files are sorted by predicted duration (longest first). This ensures slow tests start early and run concurrently with faster tests, preventing the "long tail" problem where all workers finish except one stuck on slow tests.
+
+5. **API-aware predictions**: When running with `-- -api vk`, only Vulkan backend timings are used for predictions. This prevents filtered runs from skewing estimates for full runs.
 
 ### State location
 

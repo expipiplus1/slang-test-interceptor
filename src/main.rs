@@ -445,9 +445,7 @@ fn main() -> Result<()> {
     };
 
     args.slang_test = Some(slang_test_path.clone());
-
-    std::env::set_current_dir(&root_dir)
-        .with_context(|| format!("Failed to change to root directory: {}", root_dir.display()))?;
+    args.root_dir = root_dir;
 
     // Fast path for dry-run: skip TestRunner creation, stream output
     if args.dry_run {
@@ -459,7 +457,7 @@ fn main() -> Result<()> {
 
         let (rx, error_rx) = discover_tests_streaming(
             &slang_test_path,
-            &root_dir,
+            &args.root_dir,
             &args.filters,
             &args.ignore_patterns,
             &args.apis,
