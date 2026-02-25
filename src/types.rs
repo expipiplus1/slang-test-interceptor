@@ -420,8 +420,6 @@ pub struct TestStats {
     pub compiling_since: Mutex<Option<Instant>>,
     /// Observed timings keyed by test identifier (e.g., "tests/foo.slang.4")
     pub observed_timings: Mutex<HashMap<String, f64>>,
-    /// Sum of predicted times for completed tests (for accurate progress %)
-    pub completed_predicted_time: Mutex<f64>,
 }
 
 impl TestStats {
@@ -472,16 +470,6 @@ impl TestStats {
     pub fn get_observed_timings(&self) -> HashMap<String, f64> {
         self.observed_timings.lock().unwrap().clone()
     }
-
-    /// Add to the completed predicted time total
-    pub fn add_completed_predicted_time(&self, time: f64) {
-        *self.completed_predicted_time.lock().unwrap() += time;
-    }
-
-    /// Get the sum of predicted times for completed tests
-    pub fn get_completed_predicted_time(&self) -> f64 {
-        *self.completed_predicted_time.lock().unwrap()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -496,19 +484,29 @@ pub struct FailureInfo {
 // Work Pool
 // ============================================================================
 
+/// Tracks an in-flight batch: when it started and its predicted duration
+#[derive(Clone)]
+struct InFlightBatch {
+    start_time: Instant,
+    predicted_duration: f64,
+}
+
 pub struct WorkPool {
     /// Pre-built batches of tests, ready to be popped by workers
     batches: Mutex<Vec<Vec<String>>>,
     /// Pending files that need to be rebuilt into batches (retries, repooled after crash)
     pending_files: Mutex<Vec<String>>,
-    /// Predicted time remaining in the pool (batches + pending, not in-flight)
-    predicted_remaining: Mutex<f64>,
+    /// In-flight batches keyed by batch ID (for tracking remaining time)
+    in_flight: Mutex<HashMap<usize, InFlightBatch>>,
+    /// Counter for generating batch IDs
+    next_batch_id: AtomicUsize,
+    /// Predicted time for tests still in the pool (not in-flight, not completed)
+    pool_predicted: Mutex<f64>,
     /// Configuration for batch building
     max_batch_size: usize,
     target_batch_duration: f64,
     /// Predictions keyed by test identifier (e.g., "tests/foo.slang.4")
     pub predictions: HashMap<String, f64>,
-    pub total_predicted: f64,
     pub has_timing_data: bool,
 }
 
@@ -536,11 +534,12 @@ impl WorkPool {
         Self {
             batches: Mutex::new(batches),
             pending_files: Mutex::new(Vec::new()),
-            predicted_remaining: Mutex::new(total_predicted),
+            in_flight: Mutex::new(HashMap::new()),
+            next_batch_id: AtomicUsize::new(0),
+            pool_predicted: Mutex::new(total_predicted),
             max_batch_size,
             target_batch_duration,
             predictions,
-            total_predicted,
             has_timing_data,
         }
     }
@@ -615,22 +614,21 @@ impl WorkPool {
         batches
     }
 
-    pub fn predicted_remaining(&self) -> f64 {
-        *self.predicted_remaining.lock().unwrap()
-    }
-
     /// Add a file back to the pool (for retries or repooled tests after crash).
     /// This triggers a rebuild of batches on the next try_get_batch call.
     pub fn add_file(&self, file: String) {
         let predicted = self.predictions.get(&file).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-        *self.predicted_remaining.lock().unwrap() += predicted;
+        *self.pool_predicted.lock().unwrap() += predicted;
         self.pending_files.lock().unwrap().push(file);
     }
 
     pub fn is_empty(&self) -> bool {
-        self.batches.lock().unwrap().is_empty() && self.pending_files.lock().unwrap().is_empty()
+        self.batches.lock().unwrap().is_empty()
+            && self.pending_files.lock().unwrap().is_empty()
+            && self.in_flight.lock().unwrap().is_empty()
     }
 
+    /// Returns number of tests in pool (not including in-flight)
     pub fn remaining(&self) -> usize {
         let batches = self.batches.lock().unwrap();
         let pending = self.pending_files.lock().unwrap();
@@ -638,13 +636,15 @@ impl WorkPool {
     }
 
     /// Get the next batch of tests to run.
+    /// Returns (batch_id, tests) where batch_id is used to mark the batch complete later.
     /// If there are pending files (retries/repooled), rebuilds batches first.
-    pub fn try_get_batch(&self) -> Option<Vec<String>> {
+    pub fn try_get_batch(&self) -> Option<(usize, Vec<String>)> {
         // Check if we need to rebuild batches due to pending files
         {
             let mut pending = self.pending_files.lock().unwrap();
             if !pending.is_empty() {
                 let mut batches = self.batches.lock().unwrap();
+                let mut pool_predicted = self.pool_predicted.lock().unwrap();
 
                 // Collect all remaining tests: pending + already batched
                 let mut all_files: Vec<String> = pending.drain(..).collect();
@@ -652,7 +652,12 @@ impl WorkPool {
                     all_files.extend(batch);
                 }
 
-                // Rebuild batches (predicted_remaining already includes pending times)
+                // Recalculate pool_predicted from all_files
+                *pool_predicted = all_files.iter()
+                    .map(|f| self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
+                    .sum();
+
+                // Rebuild batches
                 *batches = Self::build_batches(
                     all_files,
                     &self.predictions,
@@ -663,19 +668,58 @@ impl WorkPool {
             }
         }
 
-        // Pop the next batch and subtract its predicted time
+        // Pop the next batch
         let batch = self.batches.lock().unwrap().pop()?;
-        let batch_predicted: f64 = batch.iter()
+
+        // Calculate predicted duration for this batch
+        let predicted_duration: f64 = batch.iter()
             .map(|f| self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
             .sum();
-        *self.predicted_remaining.lock().unwrap() -= batch_predicted;
-        Some(batch)
+
+        // Subtract from pool predicted
+        *self.pool_predicted.lock().unwrap() -= predicted_duration;
+
+        // Track as in-flight
+        let batch_id = self.next_batch_id.fetch_add(1, Ordering::SeqCst);
+        self.in_flight.lock().unwrap().insert(batch_id, InFlightBatch {
+            start_time: Instant::now(),
+            predicted_duration,
+        });
+
+        Some((batch_id, batch))
+    }
+
+    /// Mark a batch as complete (tests finished running)
+    pub fn complete_batch(&self, batch_id: usize) {
+        self.in_flight.lock().unwrap().remove(&batch_id);
+    }
+
+    /// Calculate estimated time remaining.
+    /// Takes into account pool remaining, in-flight batch progress, and the "long pole" problem.
+    pub fn calculate_eta(&self, num_workers: usize) -> f64 {
+        let pool_remaining = *self.pool_predicted.lock().unwrap();
+        let in_flight = self.in_flight.lock().unwrap();
+
+        let mut in_flight_remaining = 0.0f64;
+        let mut longest_remaining = 0.0f64;
+
+        for batch in in_flight.values() {
+            let elapsed = batch.start_time.elapsed().as_secs_f64();
+            let remaining = (batch.predicted_duration - elapsed).max(0.0);
+            in_flight_remaining += remaining;
+            longest_remaining = longest_remaining.max(remaining);
+        }
+
+        let total_remaining = pool_remaining + in_flight_remaining;
+        let parallel_eta = total_remaining / num_workers.max(1) as f64;
+
+        // ETA is the max of parallel completion time and the longest single batch
+        parallel_eta.max(longest_remaining)
     }
 
     /// Get a single-test batch (used for adaptive spawning)
-    pub fn try_get_medium_batch(&self) -> Option<Vec<String>> {
+    pub fn try_get_medium_batch(&self) -> Option<(usize, Vec<String>)> {
         // For adaptive spawning, just get a regular batch
-        // The batches are already well-formed
         self.try_get_batch()
     }
 }
@@ -686,24 +730,22 @@ impl WorkPool {
 
 pub struct ProgressDisplay {
     total_files: usize,
-    total_predicted_time: f64,
     start_time: Instant,
     machine_output: bool,
     last_reported_files: AtomicUsize,
 }
 
 impl ProgressDisplay {
-    pub fn new(total_files: usize, total_predicted_time: f64, machine_output: bool) -> Self {
+    pub fn new(total_files: usize, machine_output: bool) -> Self {
         Self {
             total_files,
-            total_predicted_time,
             start_time: Instant::now(),
             machine_output,
             last_reported_files: AtomicUsize::new(0),
         }
     }
 
-    pub fn update(&self, stats: &TestStats, files_completed: usize, batches_running: usize, batches_remaining: usize, predicted_remaining_time: Option<f64>, adaptive_running: usize) {
+    pub fn update(&self, stats: &TestStats, files_completed: usize, batches_running: usize, batches_remaining: usize, adaptive_running: usize, eta_seconds: Option<f64>) {
         let passed = stats.passed.load(Ordering::SeqCst);
         let failed = stats.failed.load(Ordering::SeqCst);
         let ignored = stats.ignored.load(Ordering::SeqCst);
@@ -723,32 +765,19 @@ impl ProgressDisplay {
                 );
             }
         } else {
-            // Calculate percentage based on completed predicted time vs total
-            // percent = completed / (completed + remaining + in_flight)
-            // Since we don't track in_flight separately, use: completed / total_predicted
-            let completed_predicted = stats.get_completed_predicted_time();
-            let percent = if self.total_predicted_time > 0.0 {
-                (completed_predicted / self.total_predicted_time * 100.0).clamp(0.0, 100.0)
-            } else {
-                (files_completed as f64 / self.total_files.max(1) as f64) * 100.0
-            };
+            // Percentage based on tests completed vs total
+            let tests_done = passed + failed + ignored;
+            let percent = (tests_done as f64 / self.total_files.max(1) as f64) * 100.0;
 
-            let eta = if let Some(predicted) = predicted_remaining_time {
-                if predicted > 1.0 && batches_running > 0 {
-                    let parallel_eta = predicted / batches_running.max(1) as f64;
-                    format!(" ETA: {:.0}s", parallel_eta)
-                } else if files_completed < self.total_files {
-                    format!(" ETA: <1s")
-                } else {
-                    String::new()
+            // Format ETA string
+            let eta = match eta_seconds {
+                Some(secs) if secs > 1.0 && files_completed < self.total_files => {
+                    format!(" ETA: {:.1}s", secs)
                 }
-            } else if files_completed > 5 && files_completed < self.total_files {
-                let rate = files_completed as f64 / elapsed;
-                let remaining = self.total_files - files_completed;
-                let eta_secs = remaining as f64 / rate;
-                format!(" ETA: {:.0}s", eta_secs)
-            } else {
-                String::new()
+                Some(_) if files_completed < self.total_files => {
+                    " ETA: <1s".to_string()
+                }
+                _ => String::new(),
             };
 
             let compiling_info = if let Some(secs) = stats.get_compiling_time() {
@@ -774,9 +803,9 @@ impl ProgressDisplay {
             };
 
             eprint!(
-                "\r\x1b[K[{:>5}/{:<5}] {:>5.1}% | {} passed, {} failed, {} ignored ({:.1}s){} [{}/{}]{}{}{}",
-                files_completed, self.total_files, percent, passed, failed, ignored, elapsed, eta,
-                batches_running, batches_remaining, turbo_info, compiling_info, stuck_info
+                "\r\x1b[K[{}/{}/{}] {:.1}% | {} passed, {} failed, {} ignored | Elapsed: {:.1}s |{}{}{}{}",
+                batches_running, batches_remaining, self.total_files, percent, passed, failed, ignored, elapsed, eta,
+                turbo_info, compiling_info, stuck_info
             );
             let _ = std::io::stderr().flush();
         }

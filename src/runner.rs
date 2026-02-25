@@ -335,13 +335,6 @@ fn process_outcome(
         ctx.stats.record_file(&base_file);
     }
 
-    // Add the predicted time for this test to completed total
-    let timing_key = TestId::parse(&outcome.name).to_timing_key();
-    let predicted = ctx.work_pool.predictions.get(&timing_key)
-        .copied()
-        .unwrap_or(DEFAULT_PREDICTED_DURATION);
-    ctx.stats.add_completed_predicted_time(predicted);
-
     match outcome.result {
         TestResult::Passed => {
             let was_retry = ctx.retried_tests.lock().unwrap().contains_key(&outcome.name);
@@ -1094,10 +1087,9 @@ impl TestRunner {
         let progress_shutdown = Arc::new(AtomicBool::new(false));
         let progress_shutdown_clone = progress_shutdown.clone();
         let total_files = test_files.len();
-        let total_predicted_time = if has_timing_data { work_pool.total_predicted } else { 0.0 };
         let machine_output = self.machine_output;
         let progress_handle = thread::spawn(move || {
-            let display = ProgressDisplay::new(total_files, total_predicted_time, machine_output);
+            let display = ProgressDisplay::new(total_files, machine_output);
             // Initialize SystemStats lazily to avoid blocking the first progress update
             let mut sys_stats: Option<SystemStats> = None;
             let mut stats_counter = 0u32;
@@ -1106,12 +1098,12 @@ impl TestRunner {
                 let batches_running = progress_running.load(Ordering::SeqCst);
                 let batches_remaining = progress_pool.remaining();
                 let adaptive_count = progress_adaptive.load(Ordering::SeqCst);
-                let predicted_remaining = if progress_pool.has_timing_data {
-                    Some(progress_pool.predicted_remaining())
+                let eta = if progress_pool.has_timing_data {
+                    Some(progress_pool.calculate_eta(batches_running + adaptive_count))
                 } else {
                     None
                 };
-                display.update(&progress_stats, files_done, batches_running, batches_remaining, predicted_remaining, adaptive_count);
+                display.update(&progress_stats, files_done, batches_running, batches_remaining, adaptive_count, eta);
 
                 stats_counter += 1;
                 if stats_counter >= 10 {
@@ -1151,7 +1143,7 @@ impl TestRunner {
                         }
 
                         let get_batch_start = Instant::now();
-                        if let Some(batch) = pool.try_get_batch() {
+                        if let Some((batch_id, batch)) = pool.try_get_batch() {
                             let get_batch_time = get_batch_start.elapsed();
                             if get_batch_time.as_millis() > 10 {
                                 debug_log!("worker {} try_get_batch took {:.3}s", worker_id, get_batch_time.as_secs_f64());
@@ -1172,6 +1164,7 @@ impl TestRunner {
                                 machine_output,
                                 verbose,
                             );
+                            pool.complete_batch(batch_id);
                         } else {
                             thread::sleep(Duration::from_millis(10));
                         }
@@ -1209,7 +1202,7 @@ impl TestRunner {
                     if should_spawn {
                         let extra_to_spawn = (num_cpus - total_running).min(4);
                         for _ in 0..extra_to_spawn {
-                            if let Some(batch) = work_pool.try_get_medium_batch() {
+                            if let Some((batch_id, batch)) = work_pool.try_get_medium_batch() {
                                 let slang_test = self.args.slang_test.as_ref().unwrap().clone();
                                 let root_dir = self.args.root_dir.clone();
                                 let extra_args = self.args.extra_args.clone();
@@ -1242,6 +1235,7 @@ impl TestRunner {
                                         machine_output,
                                         verbose,
                                     );
+                                    pool.complete_batch(batch_id);
                                     adaptive_counter.fetch_sub(1, Ordering::SeqCst);
                                 });
                                 adaptive_handles.lock().unwrap().push(handle);

@@ -38,7 +38,7 @@ pub struct Args {
     pub jobs: usize,
 
     /// Maximum files per batch (with timing data, batches target ~10s duration up to this limit)
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 300)]
     pub batch_size: usize,
 
     /// Target batch duration in seconds (only used with timing cache)
