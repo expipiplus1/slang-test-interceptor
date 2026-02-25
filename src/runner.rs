@@ -523,7 +523,7 @@ pub fn run_batch_with_pool(
                     set_compiling_core(true);
                     let _ = compiling_tx.send(true);
                     if machine_output_for_stderr {
-                        eprintln!("INFO: {}", line);
+                        eprintln!("{}", format!("INFO: {}", line).dimmed());
                     }
                 } else if line.contains("Compiling") {
                     let _ = compiling_tx.send(true);
@@ -615,12 +615,12 @@ pub fn run_batch_with_pool(
         } else {
             format!(" {}", ctx.extra_args.join(" "))
         };
-        eprintln!("\nWARNING: Batch took {:.1}s", loop_time.as_secs_f64());
-        eprintln!("  Reproduce: time {} {}{}",
+        eprintln!("{}", format!("\nWARNING: Batch took {:.1}s", loop_time.as_secs_f64()).dimmed());
+        eprintln!("{}", format!("  Reproduce: time {} {}{}",
             ctx.slang_test.display(),
             ctx.test_files.join(" "),
             extra_args_str
-        );
+        ).dimmed());
     }
 
     while let Ok((test_id, duration)) = timing_rx.try_recv() {
@@ -650,17 +650,17 @@ pub fn run_batch_with_pool(
     let stderr_join_time = stderr_join_start.elapsed();
 
     if stdout_join_time.as_secs() > 5 || stderr_join_time.as_secs() > 5 {
-        eprintln!("\nWARNING: Slow thread joins - stdout: {:.1}s, stderr: {:.1}s for {:?}",
+        eprintln!("{}", format!("\nWARNING: Slow thread joins - stdout: {:.1}s, stderr: {:.1}s for {:?}",
             stdout_join_time.as_secs_f64(),
             stderr_join_time.as_secs_f64(),
             ctx.test_files
-        );
+        ).dimmed());
     }
 
     let stderr_lines: Vec<String> = stderr_rx.try_iter().collect();
 
-    // In verbose mode, report any tests that weren't accounted for in the output
-    if ctx.verbose && !is_interrupted() && !killed_for_compilation {
+    // Report any tests that weren't accounted for in the output
+    if !is_interrupted() && !killed_for_compilation {
         let mut unaccounted: Vec<&String> = Vec::new();
         for file in ctx.test_files {
             let test_id = TestId::parse(file);
@@ -670,11 +670,13 @@ pub fn run_batch_with_pool(
             }
         }
         if !unaccounted.is_empty() {
-            eprintln!("\nWARNING: {} unaccounted tests in batch:", unaccounted.len());
+            eprintln!("{}", format!("\nWARNING: {} unaccounted tests in batch:", unaccounted.len()).yellow());
             for test in &unaccounted {
                 eprintln!("  {}", test);
             }
-            eprintln!("  seen_tests: {:?}", seen_tests);
+            if ctx.verbose {
+                eprintln!("  seen_tests: {:?}", seen_tests);
+            }
         }
     }
 

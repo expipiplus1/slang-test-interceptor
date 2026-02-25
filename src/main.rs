@@ -3,6 +3,7 @@ mod types;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use colored::Colorize;
 use crossbeam_channel;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -423,9 +424,12 @@ fn main() -> Result<()> {
 
         if available.len() > 1 {
             eprintln!(
-                "Auto-detected {} build (newest): {}",
-                build_type,
-                path.display()
+                "{}",
+                format!(
+                    "Using {} build: {}",
+                    build_type,
+                    path.display()
+                ).dimmed()
             );
             let others: Vec<_> = available
                 .iter()
@@ -433,10 +437,7 @@ fn main() -> Result<()> {
                 .map(|(name, _, _)| name.as_str())
                 .collect();
             if !others.is_empty() {
-                eprintln!("  Other available: {}", others.join(", "));
-                eprintln!(
-                    "  Use --build-type <type> or --slang-test <path> to choose a specific build"
-                );
+                eprintln!("{}", format!("  {} is also available", others.join(", ")).dimmed());
             }
         }
 
