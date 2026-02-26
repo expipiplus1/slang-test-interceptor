@@ -14,7 +14,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 use terminal_size::{terminal_size, Width};
 
-use crate::types::{*, TestId, test_to_timing_key, WorkerState, WorkerStates, Scheduler, SchedulerHandle, UnsupportedApis};
+use crate::api::UnsupportedApis;
+use crate::event_log::log_event;
+use crate::progress::{ProgressDisplay, WorkerState, WorkerStates, SystemStats};
+use crate::scheduler::{Scheduler, SchedulerHandle};
+use crate::timing::{BuildType, TimingCache};
+use crate::types::{
+    BatchContext, FailureInfo, TestId, TestOutcome, TestResult, TestStats,
+    DEFAULT_PREDICTED_DURATION, OUTPUT_TRUNCATE_LINES, test_to_timing_key,
+};
 
 // ============================================================================
 // Debug Logging
@@ -90,7 +98,7 @@ fn calculate_initial_eta(
 
     for (test, &pred) in predictions {
         longest = longest.max(pred);
-        if is_gpu_test(test) {
+        if TestId::parse(test).is_gpu_test() {
             gpu_total += pred;
         } else {
             cpu_total += pred;
@@ -647,9 +655,137 @@ fn process_outcome(
     }
 }
 
+// ============================================================================
+// Batch Execution - Helper Functions
+// ============================================================================
+
+/// Spawn the slang-test process for a batch
+fn spawn_batch_process(
+    ctx: &BatchContext,
+) -> Result<(std::process::Child, os_pipe::PipeReader), String> {
+    // Convert test names to the format slang-test accepts (strip API suffix)
+    let slang_test_args: Vec<String> = ctx.test_files
+        .iter()
+        .map(|f| TestId::parse(f).to_slang_test_arg())
+        .collect();
+
+    // Create a shared pipe for stdout and stderr so we get ordered output
+    let (pipe_reader, pipe_writer) = match os_pipe::pipe() {
+        Ok(p) => p,
+        Err(e) => return Err(format!("Failed to create pipe: {}", e)),
+    };
+    let pipe_writer2 = match pipe_writer.try_clone() {
+        Ok(p) => p,
+        Err(e) => return Err(format!("Failed to clone pipe: {}", e)),
+    };
+
+    let mut cmd = Command::new(ctx.slang_test);
+    cmd.current_dir(ctx.root_dir)
+        .arg("-explicit-test-order")
+        .arg("-disable-retries")
+        .args(&slang_test_args)
+        .args(ctx.extra_args)
+        .stdout(pipe_writer)
+        .stderr(pipe_writer2);
+
+    debug_log!("slang-test invocation: {} -explicit-test-order -disable-retries {} {}",
+        ctx.slang_test.display(),
+        slang_test_args.join(" "),
+        ctx.extra_args.join(" "));
+
+    match cmd.spawn() {
+        Ok(child) => {
+            debug_log!("slang-test spawned successfully");
+            // IMPORTANT: Drop cmd to close pipe writers in parent process
+            drop(cmd);
+            Ok((child, pipe_reader))
+        }
+        Err(e) => Err(format!("Failed to spawn slang-test: {}", e)),
+    }
+}
+
+/// Handle incomplete batch (crash/timeout) - determine what tests to repool
+fn handle_incomplete_batch(
+    ctx: &BatchContext,
+    seen_tests: &HashSet<String>,
+    exit_status: Option<std::process::ExitStatus>,
+    killed_for_timeout: bool,
+    loop_time: Duration,
+) {
+    let exit_info = if killed_for_timeout {
+        format!("timeout after {}s", ctx.timeout.as_secs())
+    } else {
+        format_exit_status(exit_status.as_ref())
+    };
+
+    // Collect all unaccounted tests
+    let mut unaccounted_tests: Vec<String> = Vec::new();
+    for file in ctx.test_files {
+        let test_id = TestId::parse(file);
+        let timing_key = test_id.to_timing_key();
+        if !seen_tests.contains(&timing_key) {
+            unaccounted_tests.push(file.clone());
+        }
+    }
+
+    // Determine if this was a test-caused crash or an external kill
+    let test_caused = killed_for_timeout || is_test_caused_crash(exit_status.as_ref());
+
+    if test_caused {
+        // Test caused the crash/timeout - blame the first unaccounted test, repool the rest
+        let crashed_test = unaccounted_tests.first().cloned();
+        let tests_to_repool: Vec<String> = unaccounted_tests.iter().skip(1).cloned().collect();
+
+        debug_log!("test-caused crash, blaming {:?}, repooling {} tests",
+            crashed_test, tests_to_repool.len());
+
+        // Batch add tests back to scheduler
+        ctx.scheduler.add_tests(tests_to_repool.clone());
+
+        if let Some(test) = crashed_test {
+            let error_type = if killed_for_timeout { "timed out" } else { "crashed" };
+            eprintln!(
+                "\n{}: slang-test {} ({}), skipping: {}",
+                "ERROR".red(),
+                error_type, exit_info, test
+            );
+            if !tests_to_repool.is_empty() {
+                eprintln!("  Repooling {} subsequent tests", tests_to_repool.len());
+            }
+            ctx.stats.failed.fetch_add(1, Ordering::SeqCst);
+            let failure_msg = if killed_for_timeout {
+                format!("Test timed out ({})", exit_info)
+            } else {
+                format!("Test caused slang-test to crash ({})", exit_info)
+            };
+            ctx.failures.lock().unwrap().push(FailureInfo {
+                test_name: test.clone(),
+                output_lines: vec![failure_msg],
+                expected: None,
+                actual: None,
+            });
+
+            // Record timing for crashed/timed-out test using actual elapsed time
+            let test_id = TestId::parse(&test);
+            let timing_key = test_id.to_timing_key();
+            ctx.stats.record_observed_timing(&timing_key, loop_time.as_secs_f64());
+        }
+    } else {
+        // External kill (SIGTERM, SIGKILL, taskkill) - repool ALL unaccounted tests
+        debug_log!("external kill detected, repooling all {} unaccounted tests", unaccounted_tests.len());
+        // Clear current line (progress bar) before printing
+        eprintln!(
+            "\r\x1b[K{}",
+            format!("slang-test killed externally ({}), repooling {} tests",
+                exit_info, unaccounted_tests.len()).dimmed()
+        );
+        // Batch add all unaccounted tests back to scheduler
+        ctx.scheduler.add_tests(unaccounted_tests);
+    }
+}
 
 // ============================================================================
-// Batch Execution
+// Batch Execution - Main Function
 // ============================================================================
 
 pub fn run_batch_with_pool(
@@ -708,6 +844,7 @@ pub fn run_batch_with_pool(
     let test_time_sum = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let test_count = Arc::new(AtomicUsize::new(0));
 
+    // RAII guard for cleanup
     struct Guard<'a> {
         running: &'a AtomicUsize,
         batch_id: std::thread::ThreadId,
@@ -740,59 +877,18 @@ pub fn run_batch_with_pool(
         return;
     }
 
-    // Convert test names to the format slang-test accepts (strip API suffix)
-    let slang_test_args: Vec<String> = ctx.test_files
-        .iter()
-        .map(|f| TestId::parse(f).to_slang_test_arg())
-        .collect();
-
-    // Create a shared pipe for stdout and stderr so we get ordered output
-    let (pipe_reader, pipe_writer) = match os_pipe::pipe() {
-        Ok(p) => p,
+    // Spawn the slang-test process
+    let (mut child, pipe_reader) = match spawn_batch_process(&ctx) {
+        Ok(result) => result,
         Err(e) => {
-            eprintln!("ERROR: Failed to create pipe: {}", e);
+            eprintln!("ERROR: {}", e);
             return;
         }
     };
-    let pipe_writer2 = match pipe_writer.try_clone() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("ERROR: Failed to clone pipe: {}", e);
-            return;
-        }
-    };
-
-    let mut cmd = Command::new(ctx.slang_test);
-    cmd.current_dir(ctx.root_dir)
-        .arg("-explicit-test-order")
-        .arg("-disable-retries")
-        .args(&slang_test_args)
-        .args(ctx.extra_args)
-        .stdout(pipe_writer)
-        .stderr(pipe_writer2);
-
-    debug_log!("slang-test invocation: {} -explicit-test-order -disable-retries {} {}",
-        ctx.slang_test.display(),
-        slang_test_args.join(" "),
-        ctx.extra_args.join(" "));
-    let mut child = match cmd.spawn() {
-        Ok(child) => {
-            debug_log!("slang-test spawned successfully");
-            child
-        }
-        Err(e) => {
-            eprintln!("ERROR: Failed to spawn slang-test: {}", e);
-            return;
-        }
-    };
-
-    // IMPORTANT: Drop the Command to close the pipe writers in the parent process.
-    // Otherwise the pipe reader will never get EOF when the child dies.
-    drop(cmd);
 
     let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded::<TestOutcome>();
-    let (timing_tx, timing_rx) = crossbeam_channel::unbounded::<(String, f64)>(); // (test_id, duration)
-    let (done_tx, done_rx) = crossbeam_channel::bounded::<bool>(1); // Signal when output is complete
+    let (timing_tx, timing_rx) = crossbeam_channel::unbounded::<(String, f64)>();
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<bool>(1);
     let (compiling_tx, compiling_rx) = crossbeam_channel::unbounded::<bool>();
 
     let machine_output_for_stderr = ctx.machine_output;
@@ -804,9 +900,7 @@ pub fn run_batch_with_pool(
         let reader = BufReader::new(pipe_reader);
 
         let mut last_test_time: Option<Instant> = None;
-        // Accumulate lines between test results - these are failure details
         let mut pending_output: Vec<String> = Vec::new();
-        // Track if we've finished the initial slang-test spew (Supported backends, Check lines)
         let mut past_initial_spew = false;
         let mut lines_read = 0;
 
@@ -818,12 +912,11 @@ pub fn run_batch_with_pool(
             if let Ok(line) = line {
                 // Detect the summary line that indicates normal completion
                 if line.starts_with("===") || line.contains("% of tests") || line == "no tests run" {
-                    // Signal early that we're done - don't wait for process exit
                     let _ = done_tx.try_send(true);
                     continue;
                 }
 
-                // Handle "Compiling" messages (originally from stderr)
+                // Handle "Compiling" messages
                 if line.contains("Compiling core module") {
                     set_compiling_core(true);
                     let _ = compiling_tx.send(true);
@@ -836,7 +929,7 @@ pub fn run_batch_with_pool(
                     continue;
                 }
 
-                // Skip slang-test initial output (before any tests run)
+                // Skip slang-test initial output
                 if line.starts_with("Supported backends:")
                     || line.starts_with("Check ")
                     || line.starts_with("Retrying ")
@@ -845,7 +938,7 @@ pub fn run_batch_with_pool(
                     continue;
                 }
 
-                // Detect end of initial spew - test output starts with [test_name] or error markers
+                // Detect end of initial spew
                 if !past_initial_spew {
                     if line.starts_with('[') || line.contains("EXPECTED{{{") || line.contains("ACTUAL{{{") {
                         past_initial_spew = true;
@@ -856,7 +949,6 @@ pub fn run_batch_with_pool(
                 if let Some(mut outcome) = parse_test_output(&line) {
                     let now = Instant::now();
 
-                    // Record timing for all test results (passed, failed, ignored)
                     let test_duration = if last_test_time.is_some() {
                         outcome.duration
                             .map(|d| d.as_secs_f64())
@@ -871,17 +963,14 @@ pub fn run_batch_with_pool(
 
                     last_test_time = Some(now);
 
-                    // Attach accumulated output to this outcome (failure details come before the FAILED line)
                     if outcome.result == TestResult::Failed {
                         outcome.failure_output = std::mem::take(&mut pending_output);
                     } else {
-                        // Clear pending output for passed/ignored tests
                         pending_output.clear();
                     }
 
                     past_initial_spew = true;
 
-                    // Extract the timing key
                     let test_id = TestId::parse(&outcome.name);
                     let timing_key = test_id.to_timing_key();
 
@@ -891,8 +980,6 @@ pub fn run_batch_with_pool(
 
                     let _ = outcome_tx.send(outcome);
                 } else if past_initial_spew {
-                    // Accumulate non-result lines (failure details, error messages)
-                    // Only after we've passed the initial slang-test spew
                     pending_output.push(line);
                 }
             }
@@ -912,6 +999,8 @@ pub fn run_batch_with_pool(
 
     let mut need_kill = false;
     debug_log!("entering batch monitor loop, expecting {} tests", expected_test_count);
+
+    // Main monitoring loop
     loop {
         if is_interrupted() {
             debug_log!("batch monitor: interrupted");
@@ -919,6 +1008,7 @@ pub fn run_batch_with_pool(
             break;
         }
 
+        // Check compilation status
         while let Ok(is_compiling) = compiling_rx.try_recv() {
             ctx.stats.set_compiling(is_compiling);
             if is_compiling {
@@ -933,10 +1023,12 @@ pub fn run_batch_with_pool(
             break;
         }
 
+        // Process timing updates
         while let Ok((test_id, duration)) = timing_rx.try_recv() {
             ctx.stats.record_observed_timing(&test_id, duration);
         }
 
+        // Process test outcomes
         while let Ok(outcome) = outcome_rx.try_recv() {
             ctx.stats.set_compiling(false);
             ctx.stats.record_test_output();
@@ -954,26 +1046,22 @@ pub fn run_batch_with_pool(
             test_count.fetch_add(1, Ordering::SeqCst);
             log_event("test", &format!("{:?} {} {} duration_ms={}", batch_id, result_str, outcome.name, duration_ms));
 
-            // Track seen tests for crash detection
             let test_id = TestId::parse(&outcome.name);
             seen_tests.insert(test_id.to_timing_key());
 
             process_outcome(outcome, &ctx, &mut failed_outcomes);
 
-            // Advance to next test in batch for progress display
             if let Some(state) = worker_state {
                 state.advance();
             }
         }
 
-        // Check if we've seen all expected tests - no need to wait for slang-test
-        // With shared stdout/stderr pipe, failure output comes before next test result
+        // Check completion conditions
         if seen_tests.len() >= expected_test_count {
             debug_log!("batch monitor: all {} tests seen", expected_test_count);
             break;
         }
 
-        // Check if output is complete (saw summary or "no tests run")
         if done_rx.try_recv().is_ok() {
             debug_log!("batch monitor: done signal received");
             break;
@@ -1018,7 +1106,6 @@ pub fn run_batch_with_pool(
         } else {
             format!(" {}", ctx.extra_args.join(" "))
         };
-        // Convert test names to slang-test argument format (strip syn and API suffix)
         let repro_args: Vec<String> = ctx.test_files
             .iter()
             .map(|f| TestId::parse(f).to_slang_test_arg())
@@ -1031,13 +1118,12 @@ pub fn run_batch_with_pool(
         ).dimmed());
     }
 
+    // Handle compilation-killed batch
     if killed_for_compilation {
         debug_log!("killed for compilation, repooling {} tests", ctx.test_files.len());
-        // Clear worker state before returning
         if let Some(state) = worker_state {
             state.clear();
         }
-        // Batch add all tests back to scheduler
         ctx.scheduler.add_tests(ctx.test_files.iter().map(|s| s.to_string()).collect());
         debug_log!("waiting for core compilation to complete");
         while is_compiling_core() && !is_interrupted() {
@@ -1047,106 +1133,35 @@ pub fn run_batch_with_pool(
         return;
     }
 
-    // Drain remaining outcomes from the channel.
-    // The output thread will close the channel when it exits (after EOF on pipe).
-    // We join the output thread to ensure we get all outcomes before proceeding.
+    // Drain remaining outcomes
     debug_log!("drain: joining output thread");
     let join_result = output_handle.join();
     debug_log!("drain: output thread joined with result {:?}", join_result.is_ok());
 
-    // Now drain any remaining items from the channels (they're closed, so this is non-blocking)
     debug_log!("drain: draining remaining outcomes");
     let mut drained_count = 0;
     while let Ok(outcome) = outcome_rx.try_recv() {
         debug_log!("drain: got outcome {}", outcome.name);
         drained_count += 1;
 
-        // Track seen tests for crash detection
         let test_id = TestId::parse(&outcome.name);
         seen_tests.insert(test_id.to_timing_key());
 
         process_outcome(outcome, &ctx, &mut failed_outcomes);
     }
     debug_log!("drain: drained {} outcomes", drained_count);
-    // Final drain of timing channel
+
     while let Ok((test_id, duration)) = timing_rx.try_recv() {
         ctx.stats.record_observed_timing(&test_id, duration);
     }
 
+    // Handle incomplete batches (crash/timeout)
     let all_tests_seen = seen_tests.len() >= expected_test_count;
     if !all_tests_seen && !is_interrupted() && !killed_for_compilation {
-        let exit_info = if killed_for_timeout {
-            format!("timeout after {}s", ctx.timeout.as_secs())
-        } else {
-            format_exit_status(exit_status.as_ref())
-        };
-
-        // Collect all unaccounted tests
-        let mut unaccounted_tests: Vec<String> = Vec::new();
-        for file in ctx.test_files {
-            let test_id = TestId::parse(file);
-            let timing_key = test_id.to_timing_key();
-            if !seen_tests.contains(&timing_key) {
-                unaccounted_tests.push(file.clone());
-            }
-        }
-
-        // Determine if this was a test-caused crash or an external kill
-        let test_caused = killed_for_timeout || is_test_caused_crash(exit_status.as_ref());
-
-        if test_caused {
-            // Test caused the crash/timeout - blame the first unaccounted test, repool the rest
-            let crashed_test = unaccounted_tests.first().cloned();
-            let tests_to_repool: Vec<String> = unaccounted_tests.iter().skip(1).cloned().collect();
-
-            debug_log!("test-caused crash, blaming {:?}, repooling {} tests",
-                crashed_test, tests_to_repool.len());
-
-            // Batch add tests back to scheduler
-            ctx.scheduler.add_tests(tests_to_repool.clone());
-
-            if let Some(test) = crashed_test {
-                let error_type = if killed_for_timeout { "timed out" } else { "crashed" };
-                eprintln!(
-                    "\n{}: slang-test {} ({}), skipping: {}",
-                    "ERROR".red(),
-                    error_type, exit_info, test
-                );
-                if !tests_to_repool.is_empty() {
-                    eprintln!("  Repooling {} subsequent tests", tests_to_repool.len());
-                }
-                ctx.stats.failed.fetch_add(1, Ordering::SeqCst);
-                let failure_msg = if killed_for_timeout {
-                    format!("Test timed out ({})", exit_info)
-                } else {
-                    format!("Test caused slang-test to crash ({})", exit_info)
-                };
-                ctx.failures.lock().unwrap().push(FailureInfo {
-                    test_name: test.clone(),
-                    output_lines: vec![failure_msg],
-                    expected: None,
-                    actual: None,
-                });
-
-                // Record timing for crashed/timed-out test using actual elapsed time
-                let test_id = TestId::parse(&test);
-                let timing_key = test_id.to_timing_key();
-                ctx.stats.record_observed_timing(&timing_key, loop_time.as_secs_f64());
-            }
-        } else {
-            // External kill (SIGTERM, SIGKILL, taskkill) - repool ALL unaccounted tests
-            debug_log!("external kill detected, repooling all {} unaccounted tests", unaccounted_tests.len());
-            // Clear current line (progress bar) before printing
-            eprintln!(
-                "\r\x1b[K{}",
-                format!("slang-test killed externally ({}), repooling {} tests",
-                    exit_info, unaccounted_tests.len()).dimmed()
-            );
-            // Batch add all unaccounted tests back to scheduler
-            ctx.scheduler.add_tests(unaccounted_tests);
-        }
+        handle_incomplete_batch(&ctx, &seen_tests, exit_status, killed_for_timeout, loop_time);
     }
 
+    // Store failure info
     for outcome in failed_outcomes {
         let info = parse_failure_info(&outcome.name, &outcome.failure_output);
         ctx.failures.lock().unwrap().push(info);
@@ -1181,14 +1196,11 @@ pub struct TestRunner {
 impl TestRunner {
     pub fn new(args: crate::Args, unsupported_apis: Option<UnsupportedApis>) -> Self {
         let machine_output = !crate::is_stderr_tty();
-        // Detect build type from slang-test path
         let build_type = args.slang_test.as_ref()
             .and_then(|p| BuildType::from_path(p));
-        // Skip API detection in batch calls if we did the check successfully
         let skip_api_detection = unsupported_apis.as_ref()
             .map(|u| u.check_completed)
             .unwrap_or(false);
-        // Don't load timing cache yet - will be loaded concurrently with discovery
         Self {
             args,
             stats: Arc::new(TestStats::default()),
@@ -1204,23 +1216,19 @@ impl TestRunner {
     }
 
     pub fn save_timing(&self) {
-        // Don't save if --no-timing-cache was used
         if self.args.no_timing_cache {
             return;
         }
-        // Only save if we have a known build type
         let Some(build_type) = self.build_type else {
             return;
         };
         let observed = self.stats.get_observed_timings();
         let mut cache = self.timing_cache.lock().unwrap();
 
-        // Save observed timings
         if !observed.is_empty() {
             cache.merge(build_type, &observed);
         }
 
-        // Calculate and save fudge factor for this run
         if let Some(fudge) = self.stats.calculate_fudge_factor() {
             let test_files = self.stats.get_test_files();
             if !test_files.is_empty() {
@@ -1234,7 +1242,7 @@ impl TestRunner {
     pub fn run(&self) -> Result<bool> {
         let start_time = Instant::now();
 
-        // Load timing cache concurrently with test discovery (via channel)
+        // Load timing cache concurrently with test discovery
         let load_cache = !self.args.no_timing_cache && self.build_type.is_some();
         let build_type = self.build_type;
         let (cache_tx, cache_rx) = crossbeam_channel::bounded::<TimingCache>(1);
@@ -1255,19 +1263,15 @@ impl TestRunner {
             &self.args.ignore_apis,
         )?;
 
-        // Collect tests while showing streaming progress (in TTY mode)
+        // Collect tests while showing streaming progress
         let mut test_files: Vec<String> = Vec::new();
         let mut cache_for_display: Option<TimingCache> = None;
         let mut shown_compiling = false;
-        // Track running totals for ETA calculation (avoids O(n²) iteration)
         let mut total_predicted: f64 = 0.0;
         let mut longest_test: f64 = 0.0;
-        // Track tests ignored due to unsupported APIs
         let mut api_ignored: usize = 0;
-        // Track unknown APIs (not in supported or unsupported lists)
         let mut unknown_apis: HashSet<String> = HashSet::new();
 
-        // Create discovery progress bar (TTY mode only)
         let discovery_pb = if self.machine_output {
             None
         } else {
@@ -1281,7 +1285,6 @@ impl TestRunner {
         };
 
         loop {
-            // Check for errors from the discovery thread
             if let Ok(error_msg) = error_rx.try_recv() {
                 if let Some(ref pb) = discovery_pb {
                     pb.finish_and_clear();
@@ -1289,7 +1292,6 @@ impl TestRunner {
                 anyhow::bail!("{}", error_msg);
             }
 
-            // Check for compiling signal
             if !shown_compiling && compiling_rx.try_recv().is_ok() {
                 if let Some(ref pb) = discovery_pb {
                     pb.set_message("\x1b[2mCompiling core module...\x1b[0m".to_string());
@@ -1297,25 +1299,20 @@ impl TestRunner {
                 shown_compiling = true;
             }
 
-            // Try to receive with a timeout so we can check compiling signal
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(test) => {
-                    // Filter out tests for unsupported APIs early
                     if let Some(ref unsupported) = self.unsupported_apis {
                         if unsupported.is_test_unsupported(&test) {
                             api_ignored += 1;
                             continue;
                         }
-                        // Track unknown APIs
                         if let Some(unknown_api) = unsupported.get_unknown_api(&test) {
                             unknown_apis.insert(unknown_api);
                         }
                     }
 
-                    // Check if cache finished loading (non-blocking)
                     if cache_for_display.is_none() {
                         if let Ok(cache) = cache_rx.try_recv() {
-                            // Cache just loaded - compute totals for tests collected so far
                             if let Some(bt) = build_type {
                                 for f in &test_files {
                                     let pred = cache.predict(bt, &test_to_timing_key(f));
@@ -1327,7 +1324,6 @@ impl TestRunner {
                         }
                     }
 
-                    // Update running totals incrementally
                     if let (Some(ref cache), Some(bt)) = (&cache_for_display, build_type) {
                         let pred = cache.predict(bt, &test_to_timing_key(&test));
                         total_predicted += pred;
@@ -1336,9 +1332,7 @@ impl TestRunner {
 
                     test_files.push(test);
 
-                    // Update progress display (only in TTY mode)
                     if let Some(ref pb) = discovery_pb {
-                        // Cap displayed workers by current test count
                         let displayed_workers = self.args.jobs.min(test_files.len());
                         let eta = if cache_for_display.is_some() {
                             let parallel_eta = total_predicted / displayed_workers as f64;
@@ -1349,11 +1343,8 @@ impl TestRunner {
                         pb.set_message(format_running_message(test_files.len(), displayed_workers, eta, api_ignored));
                     }
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    // Still waiting - continue loop to check compiling signal
-                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    // Channel closed - check for errors one more time
                     if let Ok(error_msg) = error_rx.try_recv() {
                         if let Some(ref pb) = discovery_pb {
                             pb.finish_and_clear();
@@ -1365,7 +1356,6 @@ impl TestRunner {
             }
         }
 
-        // Check for errors after discovery completes
         if let Ok(error_msg) = error_rx.try_recv() {
             if let Some(pb) = discovery_pb {
                 pb.finish_and_clear();
@@ -1373,23 +1363,16 @@ impl TestRunner {
             anyhow::bail!("{}", error_msg);
         }
 
-        // Wait for cache loading to complete if not already done
         if let Some(cache) = cache_for_display {
             *self.timing_cache.lock().unwrap() = cache;
         } else if load_cache {
-            // Cache wasn't received during discovery, wait for it now
             if let Ok(cache) = cache_rx.recv() {
                 *self.timing_cache.lock().unwrap() = cache;
             }
         }
 
-        // Sort tests for deterministic ordering
         test_files.sort();
-
-        // Store api_ignored count for later use
         self.api_ignored_count.store(api_ignored, Ordering::SeqCst);
-
-        // Track unknown APIs - warning will be printed after "Running X tests" message
         let has_unknown_apis = !unknown_apis.is_empty();
 
         if test_files.is_empty() {
@@ -1406,7 +1389,6 @@ impl TestRunner {
             if let Some(pb) = discovery_pb {
                 pb.finish_and_clear();
             }
-            // Just print the tests that would be run
             for test in &test_files {
                 println!("{}", test);
             }
@@ -1440,13 +1422,11 @@ impl TestRunner {
             return Ok(());
         }
 
-        // Cap worker counts to the number of tests - no point having more workers than tests
         let num_tests = test_files.len();
         let effective_workers = self.args.jobs.min(num_tests);
 
-        // For GPU workers, cap by number of GPU tests (only when -g is specified)
         let effective_gpu_jobs = self.args.gpu_jobs.map(|g| {
-            let gpu_test_count = test_files.iter().filter(|t| is_gpu_test(t)).count();
+            let gpu_test_count = test_files.iter().filter(|t| TestId::parse(t).is_gpu_test()).count();
             g.min(gpu_test_count.max(1))
         });
 
@@ -1455,8 +1435,6 @@ impl TestRunner {
             self.build_type.map(|bt| cache.has_timing_data(bt)).unwrap_or(false)
         };
 
-        // Build predictions map: test string -> predicted duration
-        // We use the timing key (path + variant) for lookups but store by full test string
         let predictions: HashMap<String, f64> = {
             let cache = self.timing_cache.lock().unwrap();
             let build_type = self.build_type;
@@ -1471,94 +1449,71 @@ impl TestRunner {
                 .collect()
         };
 
-        // Compute effective batch_size and batch_duration (0 means auto-calculate)
-        // Use predicted parallel runtime (ETA) for batch duration, not total sequential time
         let predicted_runtime = if has_timing_data {
             calculate_initial_eta(&predictions, effective_workers, effective_gpu_jobs)
         } else {
-            // No timing data - estimate based on default duration
             (test_files.len() as f64 * DEFAULT_PREDICTED_DURATION) / effective_workers as f64
         };
+
         let effective_batch_size = if self.args.batch_size == 0 {
             if effective_workers == 1 {
-                // Single job: put all tests in one batch (no parallelism benefit from splitting)
                 usize::MAX
             } else if has_timing_data {
-                // With timing data: 2x tests per worker
                 ((test_files.len() / effective_workers) * 2).max(1)
             } else {
-                // Without timing data, be conservative: max 50, never more than 1/nworkers
                 50.min(test_files.len() / effective_workers).max(1)
             }
         } else {
             self.args.batch_size
         };
+
         let effective_batch_duration = if self.args.batch_duration == 0.0 {
             if effective_workers == 1 {
-                // Single job: put all tests in one batch (no parallelism benefit from splitting)
                 f64::INFINITY
             } else if has_timing_data {
                 (predicted_runtime / 2.0).max(1.0)
             } else {
-                // Without timing data, use a conservative fixed duration
                 10.0
             }
         } else {
             self.args.batch_duration
         };
 
-        // Constrained random shuffle: each test is randomly placed, but constrained
-        // so it can't become the "long pole" at the end.
-        //
-        // For a test predicted to take X seconds with total run time Y:
-        // - Latest valid position = (Y - X) / Y (as fraction of schedule)
-        // - Test is placed randomly in [0, latest_valid_position]
-        //
-        // This ensures slow tests finish before the run would otherwise complete,
-        // while maintaining randomness to avoid GPU contention from clustering.
+        // Constrained random shuffle
         let sorted_files: Vec<String> = if has_timing_data {
             let mut rng = rand::thread_rng();
             let total_predicted: f64 = predictions.values().sum();
             let n = test_files.len();
 
             if total_predicted > 0.0 && n > 0 {
-                // For each test, calculate random position within its valid range
                 let mut files_with_pos: Vec<_> = test_files.iter()
                     .map(|f| {
                         let dur = predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-                        // Latest position where this test won't be a long pole
-                        // (total - dur) / total, but at least 0.5 to avoid over-constraining
                         let latest = ((total_predicted - dur) / total_predicted).max(0.5);
-                        // Random position in [0, latest]
                         let position = rng.gen_range(0.0..=latest);
                         (f.clone(), position)
                     })
                     .collect();
 
-                // Sort by position
                 files_with_pos.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                 files_with_pos.into_iter().map(|(f, _)| f).collect()
             } else {
-                // Fallback to pure random
                 let mut files = test_files.to_vec();
                 files.shuffle(&mut rng);
                 files
             }
         } else {
-            // No timing data - pure random shuffle
             let mut files = test_files.to_vec();
             files.shuffle(&mut rand::thread_rng());
             files
         };
 
-        // Calculate ETA and fudge factor for display
         let raw_eta = if has_timing_data {
             Some(calculate_initial_eta(&predictions, effective_workers, effective_gpu_jobs))
         } else {
             None
         };
 
-        // Get historical fudge factor (average of all participating tests)
         let fudge_factor = if has_timing_data {
             let cache = self.timing_cache.lock().unwrap();
             self.build_type
@@ -1568,17 +1523,14 @@ impl TestRunner {
             1.0
         };
 
-        // Apply fudge factor to displayed ETA
         let display_eta = raw_eta.map(|eta| eta * fudge_factor);
         let running_msg = format_running_message(test_files.len(), effective_workers, display_eta, api_ignored);
         if let Some(pb) = discovery_pb {
             pb.finish_with_message(running_msg);
         } else {
-            // Machine output mode
             eprintln!("{}", running_msg);
         }
 
-        // Warn about GPU tests being skipped when -g 0 is used
         if let Some(ref unsupported) = self.unsupported_apis {
             if unsupported.gpu_disabled {
                 let apis = UnsupportedApis::disabled_gpu_apis();
@@ -1589,7 +1541,6 @@ impl TestRunner {
             }
         }
 
-        // Warn about unknown APIs after "Running X tests" message
         if has_unknown_apis {
             let mut apis_list: Vec<_> = unknown_apis.iter().collect();
             apis_list.sort();
@@ -1599,15 +1550,11 @@ impl TestRunner {
             ).dimmed());
         }
 
-        // Decide if we can skip API detection in batch calls
-        // Only skip if: we did the check successfully AND no unknown APIs were found
         let skip_api_detection = self.skip_api_detection && !has_unknown_apis;
 
-        // Record initial prediction for fudge factor calculation at end of run
         if let Some(eta) = raw_eta {
             self.stats.record_initial_prediction(eta, test_files.to_vec());
         } else {
-            // Still need to record test_files for rerun command generation
             *self.stats.test_files.lock().unwrap() = test_files.to_vec();
         }
 
@@ -1621,7 +1568,6 @@ impl TestRunner {
             );
         }
 
-        // Create scheduler and handle (message-passing architecture)
         let (mut scheduler, scheduler_handle) = Scheduler::new(
             sorted_files,
             effective_batch_size,
@@ -1644,19 +1590,16 @@ impl TestRunner {
 
         let timeout = Duration::from_secs(self.args.timeout);
 
-        // Create worker states for per-worker progress display (TTY mode only)
         let worker_states = if !self.machine_output {
             Some(Arc::new(WorkerStates::new(effective_workers)))
         } else {
             None
         };
 
-        // Mark execution started so progress display can show "waiting for output"
         stats.mark_execution_started();
 
         debug_log!("about to spawn scheduler thread");
 
-        // Spawn scheduler thread
         let scheduler_handle_for_check = scheduler_handle.clone();
         let scheduler_thread = thread::Builder::new()
             .name("scheduler".to_string())
@@ -1667,7 +1610,6 @@ impl TestRunner {
 
         debug_log!("scheduler thread spawned, about to spawn progress thread");
 
-        // Spawn progress thread
         let progress_stats = stats.clone();
         let progress_running = running.clone();
         let progress_handle_for_progress = scheduler_handle.clone();
@@ -1687,7 +1629,6 @@ impl TestRunner {
                 let files_done = progress_stats.files_completed();
                 let batches_running = progress_running.load(Ordering::SeqCst);
 
-                // Get atomic status snapshot from scheduler
                 let status = progress_handle_for_progress.get_status();
                 let eta = if progress_handle_for_progress.has_timing_data {
                     Some(status.eta)
@@ -1710,14 +1651,12 @@ impl TestRunner {
 
         debug_log!("progress thread spawned, about to spawn workers");
 
-        // Check if scheduler has work before spawning workers
         let initial_status = scheduler_handle_for_check.get_status();
         if !initial_status.is_empty {
             for i in 0..effective_workers {
                 debug_log!("spawning worker {}", i);
                 let slang_test = self.args.slang_test.as_ref().unwrap().clone();
                 let root_dir = self.args.root_dir_effective.clone();
-                // Add -skip-api-detection if we've done the early API check successfully
                 let mut extra_args = self.args.extra_args.clone();
                 if skip_api_detection {
                     extra_args.push("-skip-api-detection".to_string());
@@ -1749,7 +1688,6 @@ impl TestRunner {
                         }
 
                         let get_batch_start = Instant::now();
-                        // Scheduler decides atomically what batch to give (GPU or CPU)
                         if let Some(assignment) = handle_for_worker.get_batch() {
                             let get_batch_time = get_batch_start.elapsed();
                             if get_batch_time.as_millis() > 10 {
@@ -1776,7 +1714,6 @@ impl TestRunner {
                             handle_for_worker.complete_batch(assignment.batch_id);
                             debug_log!("batch {} complete_batch done", assignment.batch_id);
                         } else {
-                            // No batch available - check status and wait
                             let status = handle_for_worker.get_status();
                             debug_log!("no batch available: batches={} pending={} in_flight={:?}",
                                 status.debug_state.0, status.debug_state.1, status.debug_state.2);
@@ -1804,7 +1741,6 @@ impl TestRunner {
                     break;
                 }
 
-                // Log state periodically (every ~1 second when DEBUG is on)
                 static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let now_ms = DEBUG_START.elapsed().as_millis() as u64;
                 let last = LAST_LOG.load(Ordering::Relaxed);
@@ -1820,17 +1756,14 @@ impl TestRunner {
             debug_log!("main loop exited, setting shutdown flag");
             shutdown.store(true, Ordering::SeqCst);
 
-            // Don't wait for workers - they'll exit on their own when they see shutdown
             debug_log!("dropping worker handles");
             drop(handles);
         }
 
-        // Shutdown scheduler and wait for it
         scheduler_handle.shutdown();
         let _ = scheduler_thread.join();
 
         progress_shutdown.store(true, Ordering::SeqCst);
-        // Must join progress thread to ensure it stops writing before we print failures
         let _ = progress_handle.join();
 
         Ok(())
@@ -1906,13 +1839,11 @@ impl TestRunner {
         print!("{}", Self::compute_external_diff(cmd, args, expected, actual, self.machine_output));
     }
 
-    /// Compute diff output as a string (can be run in parallel)
     fn compute_external_diff(cmd: &str, args: &[&str], expected: &str, actual: &str, machine_output: bool) -> String {
         use std::io::Write as _;
 
         let indent = if machine_output { "" } else { "  " };
 
-        // Use unique temp files for parallel safety
         let id = std::process::id();
         let thread_id = format!("{:?}", std::thread::current().id());
         let expected_file = std::env::temp_dir().join(format!("slang-test-expected-{}-{}.txt", id, thread_id.replace(|c: char| !c.is_alphanumeric(), "")));
@@ -1976,7 +1907,6 @@ impl TestRunner {
             let mut sorted_failures: Vec<_> = failures.iter().collect();
             sorted_failures.sort_by(|a, b| a.test_name.cmp(&b.test_name));
 
-            // Pre-compute diffs in parallel for failures that have expected/actual
             let diff_tool = resolve_diff_tool(self.args.diff.as_str());
             let machine_output = self.machine_output;
             let diff_results: Vec<Option<String>> = if diff_tool != "none" {
@@ -2011,16 +1941,13 @@ impl TestRunner {
                 vec![None; sorted_failures.len()]
             };
 
-            // Print results sequentially
             for (failure, diff_output) in sorted_failures.iter().zip(diff_results.iter()) {
                 println!("\n{}", failure.test_name.red().bold().underline());
 
                 if let (Some(expected), Some(actual)) = (&failure.expected, &failure.actual) {
                     if let Some(diff) = diff_output {
-                        // Pre-computed diff from parallel execution
                         print!("{}", diff);
                     } else {
-                        // diff_tool == "none", show inline
                         self.show_diff(expected, actual);
                     }
                 } else if !failure.output_lines.is_empty() {
@@ -2123,7 +2050,6 @@ impl TestRunner {
                 }
             }
 
-            // Batch size histogram
             let batch_sizes = self.stats.get_batch_sizes();
             if !batch_sizes.is_empty() {
                 println!("\n{}:", "Batch size distribution".yellow());
@@ -2146,7 +2072,6 @@ impl TestRunner {
             if has_file_tests {
                 print!("{}", exe);
 
-                // Only include options that were explicitly specified
                 if let Some(ref root_dir) = self.args.root_dir_original {
                     print!(" -C {}", root_dir);
                 }
@@ -2165,7 +2090,6 @@ impl TestRunner {
                     }
                 }
 
-                // Include extra args if any
                 if !self.args.extra_args.is_empty() {
                     print!(" --");
                     for arg in &self.args.extra_args {
@@ -2175,7 +2099,6 @@ impl TestRunner {
 
                 println!();
             } else {
-                // Internal tests - use slang-test directly
                 print!("{}", self.args.slang_test.as_ref().unwrap().display());
                 for arg in &test_args {
                     print!(" \"{}\"", arg);
@@ -2187,31 +2110,25 @@ impl TestRunner {
         println!("{}", "=".repeat(70));
     }
 
-    /// Print a unicode histogram of batch sizes using braille characters
     fn print_batch_histogram(&self, batch_sizes: &HashMap<usize, usize>) {
         if batch_sizes.is_empty() {
             return;
         }
 
-        // Get sorted sizes and find max count for scaling
         let mut sizes: Vec<_> = batch_sizes.iter().collect();
         sizes.sort_by_key(|(size, _)| *size);
 
         let max_count = *sizes.iter().map(|(_, count)| *count).max().unwrap_or(&1);
         let total_batches: usize = sizes.iter().map(|(_, count)| **count).sum();
 
-        // Braille characters for smooth partial fills (8 levels + empty)
-        // Fills left column bottom-to-top, then right column bottom-to-top
         const BRAILLE: [char; 9] = ['⠀', '⡀', '⡄', '⡆', '⡇', '⣇', '⣧', '⣷', '⣿'];
         const BAR_WIDTH: usize = 30;
 
         for (size, count) in &sizes {
-            // Calculate bar length (fractional)
             let ratio = **count as f64 / max_count as f64;
             let full_chars = (ratio * BAR_WIDTH as f64) as usize;
             let partial = ((ratio * BAR_WIDTH as f64 - full_chars as f64) * 8.0) as usize;
 
-            // Build the bar
             let mut bar = String::new();
             for _ in 0..full_chars {
                 bar.push('⣿');

@@ -1,4 +1,9 @@
+mod api;
+mod event_log;
+mod progress;
 mod runner;
+mod scheduler;
+mod timing;
 mod types;
 
 use anyhow::{Context, Result};
@@ -9,7 +14,8 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use runner::{set_interrupted, TestRunner, run_early_api_check};
-use types::{flush_event_log, init_event_log, log_event, UnsupportedApis};
+use event_log::{flush_event_log, init_event_log, log_event};
+use api::UnsupportedApis;
 
 // ============================================================================
 // CLI Arguments
@@ -170,42 +176,6 @@ pub fn discover_tests_via_dry_run(
     Ok(tests)
 }
 
-/// Convert a filter string to a regex pattern.
-///
-/// Special handling for file paths with variant suffixes:
-/// - `tests/foo.slang` -> matches all variants (prefix match)
-/// - `tests/foo.slang.0` -> matches only variant 0 (anchored match)
-/// - `tests/foo.slang.12` -> matches only variant 12 (anchored match)
-/// - Other patterns -> treated as raw regex
-fn filter_to_regex_pattern(filter: &str) -> String {
-    let extensions = [".slang", ".hlsl", ".glsl", ".c", ".internal"];
-
-    // Find if this has a file extension
-    for ext in &extensions {
-        if let Some(ext_pos) = filter.rfind(ext) {
-            let after_ext = &filter[ext_pos + ext.len()..];
-
-            if after_ext.is_empty() {
-                // Ends with extension (e.g., "tests/foo.slang") - escape for literal prefix match
-                return regex::escape(filter);
-            } else if after_ext.starts_with('.') {
-                // Has something after extension - check if it's a variant number
-                let potential_variant = &after_ext[1..];
-                if !potential_variant.is_empty() && potential_variant.chars().all(|c| c.is_ascii_digit()) {
-                    // This is a variant suffix (e.g., "tests/foo.slang.0")
-                    // Create anchored pattern that matches this variant only
-                    // Must be followed by space (for " syn" or " (api)") or end of string
-                    let escaped = regex::escape(filter);
-                    return format!("^{}( |$)", escaped);
-                }
-            }
-        }
-    }
-
-    // Not a recognized file path pattern - use as raw regex
-    filter.to_string()
-}
-
 /// Discover tests using slang-test -dry-run, streaming results via channel
 /// Tests are sent as they are discovered, unsorted
 /// Returns (test_receiver, error_receiver, compiling_receiver) - check error_receiver after iteration
@@ -223,13 +193,10 @@ pub fn discover_tests_streaming(
     use std::process::{Command, Stdio};
     use types::TestId;
 
-    // Compile filter regexes upfront, with special handling for file path patterns
+    // Compile filter regexes upfront - filters are used directly as regex patterns
     let filter_regexes: Vec<Regex> = filters
         .iter()
-        .map(|p| {
-            let pattern = filter_to_regex_pattern(p);
-            Regex::new(&pattern).with_context(|| format!("Invalid filter regex: {}", p))
-        })
+        .map(|p| Regex::new(p).with_context(|| format!("Invalid filter regex: {}", p)))
         .collect::<Result<Vec<_>>>()?;
 
     let ignore_regexes: Vec<Regex> = ignore_patterns
