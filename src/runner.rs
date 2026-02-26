@@ -1613,7 +1613,8 @@ impl TestRunner {
         Ok(())
     }
 
-    fn show_diff(&self, expected: &str, actual: &str) {
+    /// Show diff for "none" mode only - external diff tools are handled by parallel computation in print_summary
+    fn show_diff_none(&self, expected: &str, actual: &str) {
         let indent = if self.machine_output { "" } else { "  " };
         let indent2 = if self.machine_output { "" } else { "    " };
 
@@ -1639,48 +1640,30 @@ impl TestRunner {
             return;
         }
 
-        match resolve_diff_tool(self.args.diff.as_str()) {
-            "none" => {
-                if self.machine_output {
-                    println!("Expected:");
-                } else {
-                    println!("{}{}:", indent, "Expected".green());
-                }
-                for line in expected.lines() {
-                    if self.machine_output {
-                        println!("{}", line);
-                    } else {
-                        println!("{}{}", indent2, line.green());
-                    }
-                }
-                if self.machine_output {
-                    println!("Actual:");
-                } else {
-                    println!("{}{}:", indent, "Actual".red());
-                }
-                for line in actual.lines() {
-                    if self.machine_output {
-                        println!("{}", line);
-                    } else {
-                        println!("{}{}", indent2, line.red());
-                    }
-                }
-            }
-            "difft" => {
-                self.run_external_diff("difft", &["--color", "always"], expected, actual);
-            }
-            _ => {
-                if let Some(w) = TERM_WIDTH.as_ref().filter(|_| !self.machine_output) {
-                    self.run_external_diff("diff", &["-y", "--color=always", "-t", "-W", w], expected, actual);
-                } else {
-                    self.run_external_diff("diff", &["-y", "--color=always", "-t"], expected, actual);
-                }
+        if self.machine_output {
+            println!("Expected:");
+        } else {
+            println!("{}{}:", indent, "Expected".green());
+        }
+        for line in expected.lines() {
+            if self.machine_output {
+                println!("{}", line);
+            } else {
+                println!("{}{}", indent2, line.green());
             }
         }
-    }
-
-    fn run_external_diff(&self, cmd: &str, args: &[&str], expected: &str, actual: &str) {
-        print!("{}", Self::compute_external_diff(cmd, args, expected, actual, self.machine_output));
+        if self.machine_output {
+            println!("Actual:");
+        } else {
+            println!("{}{}:", indent, "Actual".red());
+        }
+        for line in actual.lines() {
+            if self.machine_output {
+                println!("{}", line);
+            } else {
+                println!("{}{}", indent2, line.red());
+            }
+        }
     }
 
     fn compute_external_diff(cmd: &str, args: &[&str], expected: &str, actual: &str, machine_output: bool) -> String {
@@ -1711,7 +1694,13 @@ impl TestRunner {
             match output {
                 Ok(output) => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
+                    let expected_path = expected_file.to_string_lossy();
+                    let actual_path = actual_file.to_string_lossy();
                     for line in stdout.lines() {
+                        // Skip difft file header lines (e.g., "/tmp/slang-test-actual-123.txt --- Text")
+                        if line.starts_with(expected_path.as_ref()) || line.starts_with(actual_path.as_ref()) {
+                            continue;
+                        }
                         result.push_str(&format!("{}{}\n", indent, line));
                     }
                 }
@@ -1822,7 +1811,7 @@ impl TestRunner {
                         if let Some(diff) = diff_output {
                             print!("{}", diff);
                         } else {
-                            self.show_diff(expected, actual);
+                            self.show_diff_none(expected, actual);
                         }
                     }
                     FailureContent::Output { lines } => {
