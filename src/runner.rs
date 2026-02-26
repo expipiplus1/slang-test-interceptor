@@ -1284,6 +1284,8 @@ fn spawn_progress_thread(
 
             let status = scheduler_handle.get_status();
             let eta = if scheduler_handle.has_timing_data {
+                // Record prediction for accuracy analysis (before fudge factor)
+                stats.record_eta_prediction(status.eta);
                 Some(status.eta)
             } else {
                 None
@@ -1980,6 +1982,26 @@ impl TestRunner {
                 println!("({} tests passed after retry)", retried);
             } else {
                 println!("  ({} tests passed after retry)", retried);
+            }
+        }
+
+        // Print ETA accuracy metrics (only if we had predictions)
+        if let Some((avg_error, worst_error, num_predictions)) = self.stats.analyze_eta_accuracy(elapsed.as_secs_f64()) {
+            if num_predictions >= 3 {  // Only show if we have enough data points
+                let accuracy_str = if avg_error <= 10.0 {
+                    "excellent".green()
+                } else if avg_error <= 25.0 {
+                    "good".yellow()
+                } else {
+                    "needs calibration".red()
+                };
+                if self.args.verbose || avg_error > 25.0 {
+                    // Show accuracy if verbose or if predictions are significantly off
+                    println!(
+                        "  ETA accuracy: avg {:.0}% error, worst {:.0}% error ({} samples - {})",
+                        avg_error, worst_error, num_predictions, accuracy_str
+                    );
+                }
             }
         }
 

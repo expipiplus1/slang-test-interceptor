@@ -257,6 +257,9 @@ pub struct TestStats {
     pub execution_start_time: Mutex<Option<Instant>>,
     /// List of test files in this run (for fudge factor recording)
     pub test_files: Mutex<Vec<String>>,
+    /// ETA predictions over time: (elapsed_at_prediction, eta_predicted)
+    /// Used to analyze prediction accuracy at the end of the run
+    pub eta_predictions: Mutex<Vec<(f64, f64)>>,
 }
 
 impl TestStats {
@@ -344,6 +347,56 @@ impl TestStats {
     /// Get the test files from this run
     pub fn get_test_files(&self) -> Vec<String> {
         self.test_files.lock().unwrap().clone()
+    }
+
+    /// Record an ETA prediction for later accuracy analysis
+    /// Called frequently but we only sample periodically to avoid excessive data
+    pub fn record_eta_prediction(&self, eta: f64) {
+        let Some(start_time) = *self.execution_start_time.lock().unwrap() else {
+            return;
+        };
+        // Only record if we have a meaningful prediction
+        if eta > 0.1 {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let mut predictions = self.eta_predictions.lock().unwrap();
+            // Sample every ~0.5 seconds to avoid too much data
+            if predictions.is_empty() ||
+               elapsed - predictions.last().unwrap().0 > 0.5 {
+                predictions.push((elapsed, eta));
+            }
+        }
+    }
+
+    /// Analyze ETA prediction accuracy.
+    /// Returns: (avg_error_pct, worst_error_pct, num_predictions)
+    /// Error is calculated as |predicted_remaining - actual_remaining| / actual_remaining
+    pub fn analyze_eta_accuracy(&self, total_elapsed: f64) -> Option<(f64, f64, usize)> {
+        let predictions = self.eta_predictions.lock().unwrap();
+        if predictions.is_empty() {
+            return None;
+        }
+
+        let mut total_error: f64 = 0.0;
+        let mut worst_error: f64 = 0.0;
+        let mut count = 0;
+
+        for (elapsed_at_prediction, eta_predicted) in predictions.iter() {
+            // Actual remaining time from the point of prediction
+            let actual_remaining = total_elapsed - elapsed_at_prediction;
+            if actual_remaining > 1.0 {  // Only analyze predictions with meaningful remaining time
+                // Error as percentage of actual remaining time
+                let error = (eta_predicted - actual_remaining).abs() / actual_remaining;
+                total_error += error;
+                worst_error = worst_error.max(error);
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            Some((total_error / count as f64 * 100.0, worst_error * 100.0, count))
+        } else {
+            None
+        }
     }
 }
 
