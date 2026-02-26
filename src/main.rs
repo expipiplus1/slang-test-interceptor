@@ -1,4 +1,5 @@
 mod api;
+mod discovery;
 mod event_log;
 mod progress;
 mod runner;
@@ -6,16 +7,15 @@ mod scheduler;
 mod timing;
 mod types;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
-use crossbeam_channel;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use runner::{set_interrupted, TestRunner, run_early_api_check};
+use discovery::{run_concurrent_discovery, DiscoveryConfig};
+use runner::{set_interrupted, TestRunner};
 use event_log::{flush_event_log, init_event_log, log_event};
-use api::UnsupportedApis;
 
 // ============================================================================
 // CLI Arguments
@@ -151,178 +151,6 @@ pub fn is_stderr_tty() -> bool {
     std::io::stderr().is_terminal()
 }
 
-/// Discover all tests using slang-test -dry-run (blocking version)
-/// Returns a list of test identifiers which can be:
-/// - Simple: "tests/path/file.slang"
-/// - With variant: "tests/path/file.slang.0 (vk)"
-/// - Synthesized: "tests/path/file.slang.1 syn (llvm)"
-/// - Internal: "slang-unit-test-tool/modulePtr.internal"
-/// Filters support regex patterns (e.g., "^tests/compute" for prefix, "diagnostic" for infix)
-pub fn discover_tests_via_dry_run(
-    slang_test: &PathBuf,
-    root_dir: &PathBuf,
-    filters: &[String],
-    ignore_patterns: &[String],
-    apis: &[String],
-    ignore_apis: &[String],
-) -> Result<Vec<String>> {
-    let (rx, error_rx, _compiling_rx) = discover_tests_streaming(slang_test, root_dir, filters, ignore_patterns, apis, ignore_apis)?;
-    let mut tests: Vec<String> = rx.iter().collect();
-    // Check for errors after iteration completes
-    if let Ok(error_msg) = error_rx.try_recv() {
-        anyhow::bail!("{}", error_msg);
-    }
-    tests.sort();
-    Ok(tests)
-}
-
-/// Discover tests using slang-test -dry-run, streaming results via channel
-/// Tests are sent as they are discovered, unsorted
-/// Returns (test_receiver, error_receiver, compiling_receiver) - check error_receiver after iteration
-/// The compiling_receiver signals when "Compiling core module" is detected on stderr
-pub fn discover_tests_streaming(
-    slang_test: &PathBuf,
-    root_dir: &PathBuf,
-    filters: &[String],
-    ignore_patterns: &[String],
-    apis: &[String],
-    ignore_apis: &[String],
-) -> Result<(crossbeam_channel::Receiver<String>, crossbeam_channel::Receiver<String>, crossbeam_channel::Receiver<()>)> {
-    use regex::Regex;
-    use std::io::{BufRead, BufReader};
-    use std::process::{Command, Stdio};
-    use types::TestId;
-
-    // Compile filter regexes upfront - filters are used directly as regex patterns
-    let filter_regexes: Vec<Regex> = filters
-        .iter()
-        .map(|p| Regex::new(p).with_context(|| format!("Invalid filter regex: {}", p)))
-        .collect::<Result<Vec<_>>>()?;
-
-    let ignore_regexes: Vec<Regex> = ignore_patterns
-        .iter()
-        .map(|p| Regex::new(p).with_context(|| format!("Invalid ignore regex: {}", p)))
-        .collect::<Result<Vec<_>>>()?;
-
-    // Clone API filters for the thread
-    let apis: Vec<String> = apis.to_vec();
-    let ignore_apis: Vec<String> = ignore_apis.to_vec();
-
-    // Log the dry-run invocation
-    log_event("dry_run", &format!("{} -dry-run -skip-api-detection", slang_test.display()));
-
-    let mut child = Command::new(slang_test)
-        .arg("-dry-run")
-        .arg("-skip-api-detection")
-        .current_dir(root_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("Failed to run {} -dry-run", slang_test.display()))?;
-
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let (error_tx, error_rx) = crossbeam_channel::bounded::<String>(1);
-    let (compiling_tx, compiling_rx) = crossbeam_channel::bounded::<()>(1);
-
-    // Spawn a thread to check stderr for "unknown option" error (old slang-test)
-    // and "Compiling core module" message
-    let stderr_error_tx = error_tx.clone();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                if line.contains("unknown option") && line.contains("-dry-run") {
-                    let _ = stderr_error_tx.send(
-                        "Your slang-test is too old and does not support the -dry-run option. \
-                         Please update to a newer version of slang.".to_string()
-                    );
-                    return;
-                }
-                if line.contains("Compiling core module") {
-                    let _ = compiling_tx.try_send(());
-                }
-            }
-        }
-    });
-
-    // Label for reaper logging
-    let reaper_label = format!("dry_run:{}", slang_test.display());
-
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-
-            // "no tests run" means we're done - send to reaper and return immediately
-            if line == "no tests run" {
-                runner::reap_process_with_label(child, reaper_label);
-                return;
-            }
-
-            // Skip header lines
-            if line.starts_with("Supported backends:") || line.starts_with("Check ") {
-                continue;
-            }
-
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            // Apply ignore patterns (regex)
-            if ignore_regexes.iter().any(|re| re.is_match(line)) {
-                continue;
-            }
-
-            // Apply filter patterns (regex) - test must match at least one filter
-            if !filter_regexes.is_empty() && !filter_regexes.iter().any(|re| re.is_match(line)) {
-                continue;
-            }
-
-            // Apply API filters
-            let test_id = TestId::parse(line);
-            let test_api = test_id.api.as_deref();
-
-            // If --api is specified, only include tests matching one of the APIs
-            if !apis.is_empty() {
-                match test_api {
-                    Some(api) if apis.iter().any(|a| a.eq_ignore_ascii_case(api)) => {}
-                    _ => continue, // Skip tests without API or with non-matching API
-                }
-            }
-
-            // If --ignore-api is specified, exclude tests matching any of the APIs
-            if !ignore_apis.is_empty() {
-                if let Some(api) = test_api {
-                    if ignore_apis.iter().any(|a| a.eq_ignore_ascii_case(api)) {
-                        continue;
-                    }
-                }
-            }
-
-            if tx.send(line.to_string()).is_err() {
-                break;
-            }
-        }
-
-        // Send to reaper for async cleanup instead of blocking on wait
-        runner::reap_process_with_label(child, reaper_label);
-    });
-
-    // Check immediately if there's an error (give it a moment to detect)
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    if let Ok(error_msg) = error_rx.try_recv() {
-        anyhow::bail!("{}", error_msg);
-    }
-
-    Ok((rx, error_rx, compiling_rx))
-}
 
 fn detect_slang_test_build(
     root_dir: &PathBuf,
@@ -477,141 +305,46 @@ fn main() -> Result<()> {
 
     args.slang_test = Some(slang_test_path.clone());
 
-    // Start early API detection (unless disabled)
-    let api_check_rx = if !args.no_early_api_check {
-        Some(run_early_api_check(&slang_test_path, &root_dir))
-    } else {
-        None
+    // Detect build type for timing cache
+    let build_type = timing::BuildType::from_path(&slang_test_path);
+
+    // Run concurrent discovery: API check, timing cache load, and -dry-run all at once
+    let discovery_config = DiscoveryConfig {
+        slang_test: &slang_test_path,
+        root_dir: &root_dir,
+        filters: &args.filters,
+        ignore_patterns: &args.ignore_patterns,
+        apis: &args.apis,
+        ignore_apis: &args.ignore_apis,
+        no_early_api_check: args.no_early_api_check,
+        no_timing_cache: args.no_timing_cache,
+        build_type,
+        gpu_jobs: args.gpu_jobs,
+        machine_output: !is_stderr_tty(),
+        num_workers: args.jobs,
     };
 
-    // Fast path for dry-run: skip TestRunner creation, stream output
+    let discovery_result = run_concurrent_discovery(&discovery_config)?;
+
+    // Handle dry-run: just print tests and exit
     if args.dry_run {
-        let is_tty = is_stderr_tty();
-
-        // Wait for API check to complete (with timeout) for filtering
-        let unsupported_apis: Option<UnsupportedApis> = {
-            let base = api_check_rx.and_then(|rx| {
-                rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
-            });
-            // Handle -g 0: mark all GPU APIs as unsupported
-            if args.gpu_jobs == Some(0) {
-                let mut result = base.unwrap_or_else(UnsupportedApis::platform_defaults);
-                result.disable_all_gpu_apis();
-                Some(result)
-            } else {
-                base
-            }
-        };
-
-        let (rx, error_rx, compiling_rx) = discover_tests_streaming(
-            &slang_test_path,
-            &args.root_dir_effective,
-            &args.filters,
-            &args.ignore_patterns,
-            &args.apis,
-            &args.ignore_apis,
-        )?;
-
-        let mut count = 0;
-        let mut api_ignored = 0;
-        let mut shown_compiling = false;
-
-        loop {
-            // Check for errors from the discovery thread
-            if let Ok(error_msg) = error_rx.try_recv() {
-                anyhow::bail!("{}", error_msg);
-            }
-
-            // Check for compiling signal
-            if !shown_compiling && compiling_rx.try_recv().is_ok() {
-                if is_tty {
-                    eprint!("\x1b[2mCompiling core module...\x1b[0m");
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
-                }
-                shown_compiling = true;
-            }
-
-            // Try to receive with a timeout so we can check compiling signal
-            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(test) => {
-                    // Filter tests for unsupported APIs
-                    if let Some(ref unsupported) = unsupported_apis {
-                        if unsupported.is_test_unsupported(&test) {
-                            api_ignored += 1;
-                            continue;
-                        }
-                    }
-
-                    // On first test output, clear any compiling message
-                    if count == 0 && shown_compiling && is_tty {
-                        eprint!("\r\x1b[K");
-                    }
-                    println!("{}", test);
-                    count += 1;
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    // Still waiting - continue loop to check compiling signal
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    // Channel closed - check for errors one more time
-                    if let Ok(error_msg) = error_rx.try_recv() {
-                        anyhow::bail!("{}", error_msg);
-                    }
-                    if shown_compiling && count == 0 && is_tty {
-                        eprint!("\r\x1b[K");
-                    }
-                    break;
-                }
-            }
+        for test in &discovery_result.tests {
+            println!("{}", test);
         }
-
-        let ignored_msg = if api_ignored > 0 {
-            format!(" (ignoring {} tests on unsupported APIs)", api_ignored)
+        let ignored_msg = if discovery_result.api_ignored_count > 0 {
+            format!(
+                " (ignoring {} tests on unsupported APIs)",
+                discovery_result.api_ignored_count
+            )
         } else {
             String::new()
         };
-        eprintln!("{} tests would be run{}", count, ignored_msg);
+        eprintln!("{} tests would be run{}", discovery_result.tests.len(), ignored_msg);
         std::process::exit(0);
     }
 
-    // Wait for API check to complete before creating TestRunner
-    let unsupported_apis: Option<UnsupportedApis> = if let Some(rx) = api_check_rx {
-        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(mut result) => {
-                // Warn if API check had errors
-                if let Some(ref error) = result.error {
-                    eprintln!("{}", format!("Warning: API detection: {}", error).dimmed());
-                }
-                // If -g 0, mark all GPU APIs as unsupported
-                if args.gpu_jobs == Some(0) {
-                    result.disable_all_gpu_apis();
-                }
-                Some(result)
-            }
-            Err(_) => {
-                eprintln!("{}", "Warning: API detection timed out, will detect APIs per-batch".dimmed());
-                // Even if API check timed out, still handle -g 0
-                if args.gpu_jobs == Some(0) {
-                    let mut result = UnsupportedApis::platform_defaults();
-                    result.disable_all_gpu_apis();
-                    Some(result)
-                } else {
-                    None
-                }
-            }
-        }
-    } else {
-        // No early API check - but still handle -g 0
-        if args.gpu_jobs == Some(0) {
-            let mut result = UnsupportedApis::platform_defaults();
-            result.disable_all_gpu_apis();
-            Some(result)
-        } else {
-            None
-        }
-    };
-
-    let runner = TestRunner::new(args, unsupported_apis);
+    // Create TestRunner with pre-discovered data
+    let runner = TestRunner::new_with_discovery(args, discovery_result);
     let success = runner.run()?;
 
     runner.save_timing();
