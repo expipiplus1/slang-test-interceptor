@@ -1,11 +1,11 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use sysinfo::{CpuRefreshKind, RefreshKind, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::event_log::log_event;
-use crate::types::TestStats;
+use crate::types::{TestStats, DEBUG_START};
 
 /// Sentinel value meaning "no test running" (worker is idle or between batches)
 pub const WORKER_IDLE: usize = usize::MAX;
@@ -27,6 +27,8 @@ pub struct WorkerState {
     pub current_test_idx: AtomicUsize,
     /// The current batch of tests (set when batch starts, cleared when batch ends)
     pub current_batch: Mutex<Vec<String>>,
+    /// When the current test started, as microseconds since DEBUG_START (0 = not set)
+    pub current_test_start_us: AtomicU64,
 }
 
 impl WorkerState {
@@ -34,34 +36,55 @@ impl WorkerState {
         Self {
             current_test_idx: AtomicUsize::new(WORKER_IDLE),
             current_batch: Mutex::new(Vec::new()),
+            current_test_start_us: AtomicU64::new(0),
         }
+    }
+
+    /// Get current time as microseconds since DEBUG_START
+    fn now_us() -> u64 {
+        DEBUG_START.elapsed().as_micros() as u64
     }
 
     /// Called when a worker starts a new batch
     pub fn start_batch(&self, batch: &[String]) {
         *self.current_batch.lock().unwrap() = batch.to_vec();
-        self.current_test_idx.store(0, Ordering::SeqCst);
+        self.current_test_start_us.store(Self::now_us(), Ordering::Release);
+        self.current_test_idx.store(0, Ordering::Release);
     }
 
     /// Called when a test completes - advance to next test
     pub fn advance(&self) {
-        self.current_test_idx.fetch_add(1, Ordering::SeqCst);
+        self.current_test_start_us.store(Self::now_us(), Ordering::Release);
+        self.current_test_idx.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Called when batch completes or worker goes idle
     pub fn clear(&self) {
-        self.current_test_idx.store(WORKER_IDLE, Ordering::SeqCst);
+        self.current_test_idx.store(WORKER_IDLE, Ordering::Release);
+        self.current_test_start_us.store(0, Ordering::Release);
         self.current_batch.lock().unwrap().clear();
     }
 
     /// Get the currently running test name, if any
     pub fn current_test(&self) -> Option<String> {
-        let idx = self.current_test_idx.load(Ordering::SeqCst);
+        let idx = self.current_test_idx.load(Ordering::Acquire);
         if idx == WORKER_IDLE {
             return None;
         }
         let batch = self.current_batch.lock().unwrap();
         batch.get(idx).cloned()
+    }
+
+    /// Get how long the current test has been running, in seconds.
+    /// Infrastructure for potential test-level ETA refinement.
+    #[allow(dead_code)]
+    pub fn current_test_elapsed_secs(&self) -> Option<f64> {
+        let start_us = self.current_test_start_us.load(Ordering::Acquire);
+        if start_us == 0 {
+            return None;
+        }
+        let now_us = Self::now_us();
+        Some((now_us.saturating_sub(start_us)) as f64 / 1_000_000.0)
     }
 }
 
@@ -204,7 +227,7 @@ impl ProgressDisplay {
             } else if at_99_pct && !reported_99 {
                 true  // Report at 99%
             } else {
-                elapsed_ms >= last_report_ms + 3000  // Every 3 seconds
+                elapsed_ms >= last_report_ms + 500  // Every 500ms (for debugging)
             };
 
             if should_report {

@@ -729,7 +729,8 @@ fn spawn_output_reader(pipe_reader: os_pipe::PipeReader) -> OutputReaderHandle {
                         let test_id = TestId::parse(&outcome.name);
                         let timing_key = test_id.to_timing_key();
 
-                        if test_duration > 0.0 {
+                        // Only record timing for tests that actually ran (not ignored)
+                        if test_duration > 0.0 && outcome.result != TestResult::Ignored {
                             let _ = timing_tx.send((timing_key.clone(), test_duration));
                         }
 
@@ -821,6 +822,14 @@ fn monitor_batch_execution(
             let test_id = TestId::parse(&outcome.name);
             seen_tests.insert(test_id.to_timing_key());
 
+            // Notify scheduler of test completion for ETA tracking
+            if let Some(actual_duration) = outcome.duration {
+                let predicted = ctx.scheduler.predictions.get(&outcome.name)
+                    .copied()
+                    .unwrap_or(DEFAULT_PREDICTED_DURATION);
+                ctx.scheduler.test_completed(ctx.batch_id, predicted, actual_duration.as_secs_f64());
+            }
+
             process_outcome(outcome, ctx, failed_outcomes);
 
             if let Some(state) = worker_state {
@@ -888,6 +897,14 @@ fn drain_remaining_outcomes(
         let test_id = TestId::parse(&outcome.name);
         seen_tests.insert(test_id.to_timing_key());
 
+        // Notify scheduler of test completion for ETA tracking
+        if let Some(actual_duration) = outcome.duration {
+            let predicted = ctx.scheduler.predictions.get(&outcome.name)
+                .copied()
+                .unwrap_or(DEFAULT_PREDICTED_DURATION);
+            ctx.scheduler.test_completed(ctx.batch_id, predicted, actual_duration.as_secs_f64());
+        }
+
         process_outcome(outcome, ctx, failed_outcomes);
     }
     debug_log!("drain: drained {} outcomes", drained_count);
@@ -936,6 +953,7 @@ pub fn run_batch_with_pool(
     running: &AtomicUsize,
     verbose: bool,
     worker_state: Option<&WorkerState>,
+    batch_id: usize,
 ) {
     let ctx = BatchContext {
         slang_test,
@@ -950,6 +968,7 @@ pub fn run_batch_with_pool(
         scheduler,
         running,
         verbose,
+        batch_id,
     };
 
     // Track current test for progress display
@@ -1337,6 +1356,7 @@ fn spawn_worker_thread(
                         &running,
                         verbose,
                         my_state,
+                        assignment.batch_id,
                     );
                     debug_log!("batch {} completed, calling complete_batch", assignment.batch_id);
                     scheduler_handle.complete_batch(assignment.batch_id);

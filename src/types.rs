@@ -379,6 +379,8 @@ pub struct BatchContext<'a> {
     pub scheduler: &'a SchedulerHandle,
     pub running: &'a AtomicUsize,
     pub verbose: bool,
+    /// Scheduler's batch ID (for test completion tracking)
+    pub batch_id: usize,
 }
 
 // ============================================================================

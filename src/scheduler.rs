@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::types::{BatchKind, TestId, DEFAULT_PREDICTED_DURATION};
 
@@ -13,6 +12,12 @@ pub enum SchedulerMessage {
     },
     /// Worker completed a batch
     CompleteBatch { batch_id: usize },
+    /// Worker completed a single test within a batch (for progress tracking)
+    TestCompleted {
+        batch_id: usize,
+        predicted: f64,
+        actual: f64,
+    },
     /// Worker wants to retry/repool tests (e.g., after crash)
     AddTests { tests: Vec<String> },
     /// Query: get atomic status snapshot (for progress display and termination check)
@@ -50,10 +55,12 @@ pub struct BatchAssignment {
 
 /// Tracks an in-flight batch
 struct InFlightBatch {
-    start_time: Instant,
-    predicted_duration: f64,
     test_count: usize,
     kind: BatchKind,
+    /// Predicted time for this batch (sum of test predictions)
+    predicted_time: f64,
+    /// Predicted time remaining (updated as tests complete)
+    remaining_predicted: f64,
 }
 
 /// A batch with its kind classification
@@ -88,6 +95,12 @@ pub struct Scheduler {
     gpu_in_flight: usize,
     /// Number of workers (for parallelism optimization)
     num_workers: usize,
+    /// Initial total predicted time (for ETA calculation)
+    initial_total_predicted: f64,
+    /// Cumulative predicted time for completed tests
+    completed_predicted: f64,
+    /// Cumulative actual time for completed tests
+    completed_actual: f64,
 }
 
 impl Scheduler {
@@ -139,6 +152,9 @@ impl Scheduler {
             gpu_jobs,
             gpu_in_flight: 0,
             num_workers,
+            initial_total_predicted: total_predicted,
+            completed_predicted: 0.0,
+            completed_actual: 0.0,
         };
 
         let handle = SchedulerHandle {
@@ -162,6 +178,9 @@ impl Scheduler {
                 }
                 SchedulerMessage::CompleteBatch { batch_id } => {
                     self.complete_batch(batch_id);
+                }
+                SchedulerMessage::TestCompleted { batch_id, predicted, actual } => {
+                    self.test_completed(batch_id, predicted, actual);
                 }
                 SchedulerMessage::AddTests { tests } => {
                     self.add_tests(tests);
@@ -526,10 +545,10 @@ impl Scheduler {
         self.next_batch_id += 1;
         let test_count = tests.len();
         self.in_flight.insert(batch_id, InFlightBatch {
-            start_time: Instant::now(),
-            predicted_duration,
             test_count,
             kind,
+            predicted_time: predicted_duration,
+            remaining_predicted: predicted_duration,
         });
 
         Some(BatchAssignment { batch_id, tests, kind })
@@ -544,22 +563,56 @@ impl Scheduler {
         }
     }
 
-    /// Calculate estimated time remaining
-    fn calculate_eta(&self, num_workers: usize) -> f64 {
-        let mut in_flight_remaining = 0.0f64;
-        let mut longest_remaining = 0.0f64;
+    /// Record completion of a single test within a batch.
+    fn test_completed(&mut self, batch_id: usize, predicted: f64, actual: f64) {
+        if predicted > 0.0 {
+            self.completed_predicted += predicted;
+            // Update remaining predicted time for this batch
+            if let Some(batch) = self.in_flight.get_mut(&batch_id) {
+                batch.remaining_predicted = (batch.remaining_predicted - predicted).max(0.0);
+            }
+        }
+        if actual > 0.0 {
+            self.completed_actual += actual;
+        }
+    }
 
-        for batch in self.in_flight.values() {
-            let elapsed = batch.start_time.elapsed().as_secs_f64();
-            let remaining = (batch.predicted_duration - elapsed).max(0.0);
-            in_flight_remaining += remaining;
-            longest_remaining = longest_remaining.max(remaining);
+    /// Calculate estimated time remaining.
+    fn calculate_eta(&self, num_workers: usize) -> f64 {
+        if self.initial_total_predicted <= 0.0 {
+            return 0.0;
         }
 
-        let total_remaining = self.pool_predicted + in_flight_remaining;
-        let parallel_eta = total_remaining / num_workers.max(1) as f64;
+        // Effective parallelism: can't have more workers than batches
+        let total_batches = self.in_flight.len() + self.batches.len();
+        let effective_workers = total_batches.min(num_workers).max(1);
 
-        parallel_eta.max(longest_remaining)
+        // Sum remaining predicted time for in-flight batches (tracked per batch)
+        let in_flight_remaining: f64 = self.in_flight.values()
+            .map(|b| b.remaining_predicted)
+            .sum();
+
+        // Total remaining = pool (not yet dispatched) + in-flight remaining
+        let remaining = self.pool_predicted + in_flight_remaining;
+        let eta = remaining.max(0.0) / effective_workers as f64;
+
+        // Debug output
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST_DEBUG: AtomicU64 = AtomicU64::new(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = LAST_DEBUG.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) >= 500 {
+            LAST_DEBUG.store(now_ms, Ordering::Relaxed);
+            eprintln!(
+                "[ETA] eta={:.1}s eff_workers={} batches={} pool={:.1}s in_flight={:.1}s",
+                eta, effective_workers, total_batches, self.pool_predicted, in_flight_remaining
+            );
+        }
+
+        eta
     }
 }
 
@@ -600,6 +653,16 @@ impl SchedulerHandle {
     /// Add a single test back to the pool
     pub fn add_test(&self, test: String) {
         self.add_tests(vec![test]);
+    }
+
+    /// Notify the scheduler that a test within a batch has completed.
+    /// This updates the batch's remaining predicted time and the global fudge factor.
+    pub fn test_completed(&self, batch_id: usize, predicted: f64, actual: f64) {
+        let _ = self.tx.send(SchedulerMessage::TestCompleted {
+            batch_id,
+            predicted,
+            actual,
+        });
     }
 
     /// Get atomic status snapshot from scheduler.
