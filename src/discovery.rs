@@ -17,16 +17,15 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use crate::api::UnsupportedApis;
+use crate::debug_log;
 use crate::event_log::log_event;
 use crate::runner::{is_interrupted, reap_process, reap_process_with_label};
 use crate::timing::{BuildType, TimingCache};
-use crate::types::{test_to_timing_key, TestId};
+use crate::types::{test_to_timing_key, TestId, DEBUG_ENABLED};
 
 /// Result of the concurrent discovery phase
 pub struct DiscoveryResult {
@@ -72,21 +71,24 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
 
     // Interrupt signal channel - wakes up select! on Ctrl-C
     let (sig_tx, sig_rx) = bounded::<()>(1);
-    let running = Arc::new(AtomicBool::new(true));
+    // Shutdown channel for the interrupt-poll thread - closed when main loop exits
+    let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
 
     // Hook into the existing interrupt system
-    let r = running.clone();
-    thread::Builder::new()
+    let interrupt_poll_handle = thread::Builder::new()
         .name("interrupt-poll".to_string())
         .spawn(move || {
-            // Poll for interrupt and signal the channel
-            while r.load(Ordering::SeqCst) {
+            // Wait for either: interrupt detected, or shutdown signal (main loop done)
+            loop {
                 if is_interrupted() {
-                    r.store(false, Ordering::SeqCst);
                     let _ = sig_tx.send(());
                     break;
                 }
-                thread::sleep(Duration::from_millis(50));
+                // Check if main loop has finished (shutdown channel closed or received)
+                match shutdown_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                }
             }
         })
         .expect("failed to spawn interrupt-poll thread");
@@ -123,6 +125,14 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
     // For progress display with ETA
     let mut total_predicted: f64 = 0.0;
     let mut longest_test: f64 = 0.0;
+    let mut fudge_factor: f64 = 1.0;
+
+    // For conservative display count during discovery.
+    // Starts with platform defaults, updated to real API results when check completes.
+    // This avoids showing inflated counts that drop once we know which APIs are unavailable.
+    let mut display_apis = UnsupportedApis::platform_defaults();
+    let mut display_count: usize = 0;
+    let mut display_ignored: usize = 0;
 
     // Progress bar for TTY mode
     let discovery_pb = if config.machine_output {
@@ -143,28 +153,64 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
     let mut api_channel_closed = config.no_early_api_check;
     let mut timing_channel_closed = config.no_timing_cache || config.build_type.is_none();
 
-    // Helper to process a test message
-    let handle_test = |test: String,
-                           timing_cache: &TimingCache,
-                           total_predicted: &mut f64,
-                           longest_test: &mut f64| {
+    // Helper: add a test's predicted duration to totals
+    let accumulate_prediction = |test: &str,
+                                  timing_cache: &TimingCache,
+                                  build_type: Option<BuildType>,
+                                  total_predicted: &mut f64,
+                                  longest_test: &mut f64| {
         if !timing_cache.timings_by_build.is_empty() {
-            if let Some(bt) = config.build_type {
-                let pred = timing_cache.predict(bt, &test_to_timing_key(&test));
+            if let Some(bt) = build_type {
+                let pred = timing_cache.predict(bt, &test_to_timing_key(test));
                 *total_predicted += pred;
                 *longest_test = longest_test.max(pred);
             }
         }
-        test
+    };
+
+    // Helper: recalculate all predictions when timing cache arrives
+    let recalculate_predictions = |tests: &[String],
+                                    timing_cache: &TimingCache,
+                                    build_type: Option<BuildType>| -> (f64, f64) {
+        let mut total: f64 = 0.0;
+        let mut longest: f64 = 0.0;
+        if let Some(bt) = build_type {
+            for test in tests {
+                let pred = timing_cache.predict(bt, &test_to_timing_key(test));
+                total += pred;
+                longest = longest.max(pred);
+            }
+        }
+        (total, longest)
+    };
+
+    // Helper: compute fudge-adjusted ETA for display
+    let compute_display_eta = |total_predicted: f64,
+                                longest_test: f64,
+                                num_workers: usize,
+                                fudge_factor: f64,
+                                has_timing: bool| -> Option<f64> {
+        if has_timing && total_predicted > 0.0 {
+            let parallel_eta = total_predicted / num_workers.max(1) as f64;
+            Some(parallel_eta.max(longest_test) * fudge_factor)
+        } else {
+            None
+        }
     };
 
     // Main discovery loop using select!
-    while running.load(Ordering::SeqCst) {
+    loop {
         // 1. Priority drain - fast non-blocking receive of all pending messages
         loop {
             match test_rx.try_recv() {
                 Ok(test) => {
-                    let test = handle_test(test, &timing_cache, &mut total_predicted, &mut longest_test);
+                    accumulate_prediction(&test, &timing_cache, config.build_type, &mut total_predicted, &mut longest_test);
+                    // Update display count (filtered by current display_apis)
+                    if display_apis.is_test_unsupported(&test) {
+                        display_ignored += 1;
+                    } else {
+                        display_count += 1;
+                    }
                     tests.push(test);
                     dirty = true;
                     has_tests = true;
@@ -183,11 +229,26 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
 
         match api_rx.try_recv() {
             Ok(result) => {
+                debug_log!("api check completed: {} unsupported", result.unsupported.len());
+                // API check completed - recalculate display counts with real API info
+                display_apis = result.clone();
+                display_count = 0;
+                display_ignored = 0;
+                for test in &tests {
+                    if display_apis.is_test_unsupported(test) {
+                        display_ignored += 1;
+                    } else {
+                        display_count += 1;
+                    }
+                }
                 unsupported_apis = Some(result);
                 api_channel_closed = true;
                 dirty = true;
             }
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                if !api_channel_closed {
+                    debug_log!("api channel closed (no result)");
+                }
                 api_channel_closed = true;
             }
             Err(crossbeam_channel::TryRecvError::Empty) => {}
@@ -195,54 +256,59 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
 
         match timing_rx.try_recv() {
             Ok(cache) => {
+                debug_log!("timing cache received: {} build types", cache.timings_by_build.len());
                 // Recalculate predictions for already-collected tests
+                (total_predicted, longest_test) = recalculate_predictions(&tests, &cache, config.build_type);
+                // Compute fudge factor from timing cache
                 if let Some(bt) = config.build_type {
-                    total_predicted = 0.0;
-                    longest_test = 0.0;
-                    for test in &tests {
-                        let pred = cache.predict(bt, &test_to_timing_key(test));
-                        total_predicted += pred;
-                        longest_test = longest_test.max(pred);
-                    }
+                    fudge_factor = cache.average_fudge_factor(bt, &tests);
                 }
                 timing_cache = cache;
                 timing_channel_closed = true;
                 dirty = true;
             }
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                if !timing_channel_closed {
+                    debug_log!("timing channel closed (no cache)");
+                }
                 timing_channel_closed = true;
             }
             Err(crossbeam_channel::TryRecvError::Empty) => {}
         }
 
         if compiling_rx.try_recv().is_ok() && !shown_compiling {
-            if let Some(ref pb) = discovery_pb {
-                pb.set_message("\x1b[2mCompiling core module...\x1b[0m".to_string());
+            if *DEBUG_ENABLED {
+                eprintln!("{}", "Compiling core module...".dimmed());
+            } else if let Some(ref pb) = discovery_pb {
+                pb.set_message("Compiling core module...".dimmed().to_string());
             }
             shown_compiling = true;
         }
 
         // 2. Check for errors
         if error.is_some() {
+            debug_log!("exiting loop: error");
             break;
         }
 
         // 3. Check if all channels are done
         if test_channel_closed && api_channel_closed && timing_channel_closed {
+            debug_log!("exiting loop: all channels closed");
             break;
         }
 
         // 4. Update progress display
         if dirty && has_tests {
-            if let Some(ref pb) = discovery_pb {
-                let displayed_workers = config.num_workers.min(tests.len().max(1));
-                let eta = if !timing_cache.timings_by_build.is_empty() && !tests.is_empty() {
-                    let parallel_eta = total_predicted / displayed_workers as f64;
-                    Some(parallel_eta.max(longest_test))
-                } else {
-                    None
-                };
-                pb.set_message(format_running_message(tests.len(), displayed_workers, eta, 0));
+            let displayed_workers = config.num_workers.min(display_count.max(1));
+            let has_timing = !timing_cache.timings_by_build.is_empty();
+            let eta = compute_display_eta(total_predicted, longest_test, displayed_workers, fudge_factor, has_timing);
+            let msg = format_running_message(display_count, displayed_workers, eta, display_ignored);
+            debug_log!("progress: {} tests, {} ignored, {} total raw", display_count, display_ignored, tests.len());
+            if *DEBUG_ENABLED {
+                // In debug mode, print with newline so it doesn't interfere with debug output
+                eprintln!("{}", msg);
+            } else if let Some(ref pb) = discovery_pb {
+                pb.set_message(msg);
             }
             dirty = false;
         }
@@ -253,29 +319,54 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
             recv(test_rx) -> msg => {
                 match msg {
                     Ok(test) => {
-                        let test = handle_test(test, &timing_cache, &mut total_predicted, &mut longest_test);
+                        accumulate_prediction(&test, &timing_cache, config.build_type, &mut total_predicted, &mut longest_test);
+                        // Update display count (filtered by current display_apis)
+                        if display_apis.is_test_unsupported(&test) {
+                            display_ignored += 1;
+                        } else {
+                            display_count += 1;
+                        }
                         tests.push(test);
                         dirty = true;
                         has_tests = true;
                     }
                     Err(_) => {
+                        if !test_channel_closed {
+                            debug_log!("test channel closed, total tests={}", tests.len());
+                        }
                         test_channel_closed = true;
                     }
                 }
             }
             recv(test_err_rx) -> msg => {
                 if let Ok(err) = msg {
+                    debug_log!("test error received");
                     error = Some(err);
                 }
             }
             recv(api_rx) -> msg => {
                 match msg {
                     Ok(result) => {
+                        debug_log!("api check completed: {} unsupported", result.unsupported.len());
+                        // API check completed - recalculate display counts with real API info
+                        display_apis = result.clone();
+                        display_count = 0;
+                        display_ignored = 0;
+                        for test in &tests {
+                            if display_apis.is_test_unsupported(test) {
+                                display_ignored += 1;
+                            } else {
+                                display_count += 1;
+                            }
+                        }
                         unsupported_apis = Some(result);
                         api_channel_closed = true;
                         dirty = true;
                     }
                     Err(_) => {
+                        if !api_channel_closed {
+                            debug_log!("api channel closed (no result)");
+                        }
                         api_channel_closed = true;
                     }
                 }
@@ -283,49 +374,57 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
             recv(timing_rx) -> msg => {
                 match msg {
                     Ok(cache) => {
+                        debug_log!("timing cache received: {} build types", cache.timings_by_build.len());
+                        (total_predicted, longest_test) = recalculate_predictions(&tests, &cache, config.build_type);
                         if let Some(bt) = config.build_type {
-                            total_predicted = 0.0;
-                            longest_test = 0.0;
-                            for test in &tests {
-                                let pred = cache.predict(bt, &test_to_timing_key(test));
-                                total_predicted += pred;
-                                longest_test = longest_test.max(pred);
-                            }
+                            fudge_factor = cache.average_fudge_factor(bt, &tests);
                         }
                         timing_cache = cache;
                         timing_channel_closed = true;
                         dirty = true;
                     }
                     Err(_) => {
+                        if !timing_channel_closed {
+                            debug_log!("timing channel closed (no cache)");
+                        }
                         timing_channel_closed = true;
                     }
                 }
             }
-            recv(compiling_rx) -> _ => {
-                if !shown_compiling {
-                    if let Some(ref pb) = discovery_pb {
-                        pb.set_message("\x1b[2mCompiling core module...\x1b[0m".to_string());
+            recv(compiling_rx) -> msg => {
+                // Only show compiling message if we actually received a signal (not channel close)
+                if msg.is_ok() && !shown_compiling {
+                    debug_log!("compiling signal received");
+                    if *DEBUG_ENABLED {
+                        eprintln!("{}", "Compiling core module...".dimmed());
+                    } else if let Some(ref pb) = discovery_pb {
+                        pb.set_message("Compiling core module...".dimmed().to_string());
                     }
                     shown_compiling = true;
                 }
             }
             recv(sig_rx) -> _ => {
+                debug_log!("interrupt signal received");
                 // Interrupt signal received, exit loop
                 break;
             }
         }
     }
 
-    // Stop the interrupt polling thread
-    running.store(false, Ordering::SeqCst);
+    debug_log!("discovery loop exited, tests={}", tests.len());
 
-    // Finish progress bar
-    if let Some(pb) = discovery_pb {
-        pb.finish_and_clear();
-    }
+    // Signal the interrupt-poll thread to exit and wait for it
+    debug_log!("signaling interrupt-poll thread to exit");
+    drop(shutdown_tx);
+    debug_log!("waiting for interrupt-poll thread to join");
+    let _ = interrupt_poll_handle.join();
+    debug_log!("interrupt-poll thread joined");
 
-    // Check for errors
+    // Check for errors before doing anything else
     if let Some(err) = error {
+        if let Some(pb) = discovery_pb {
+            pb.finish_and_clear();
+        }
         anyhow::bail!("{}", err);
     }
 
@@ -335,6 +434,8 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
         apis.disable_all_gpu_apis();
         unsupported_apis = Some(apis);
     }
+
+    debug_log!("filtering tests by API support");
 
     // Now apply API filtering to the collected tests
     let mut api_ignored_count = 0;
@@ -354,8 +455,35 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
         filtered_tests.push(test);
     }
 
+    debug_log!("filtered {} tests, {} ignored", filtered_tests.len(), api_ignored_count);
+
     // Sort tests for deterministic ordering
+    debug_log!("sorting tests");
     filtered_tests.sort();
+    debug_log!("sorting done");
+
+    // Recalculate fudge factor for filtered tests
+    if let Some(bt) = config.build_type {
+        if !timing_cache.timings_by_build.is_empty() {
+            fudge_factor = timing_cache.average_fudge_factor(bt, &filtered_tests);
+        }
+    }
+
+    // Recalculate predictions for filtered tests (api filtering may have removed some)
+    let (total_predicted, longest_test) = recalculate_predictions(&filtered_tests, &timing_cache, config.build_type);
+
+    debug_log!("finishing progress bar");
+
+    // Finish progress bar and print final summary with newline
+    if let Some(pb) = discovery_pb {
+        pb.finish_and_clear();
+        let displayed_workers = config.num_workers.min(filtered_tests.len().max(1));
+        let has_timing = !timing_cache.timings_by_build.is_empty();
+        let eta = compute_display_eta(total_predicted, longest_test, displayed_workers, fudge_factor, has_timing);
+        eprintln!("{}", format_running_message(filtered_tests.len(), displayed_workers, eta, api_ignored_count));
+    }
+
+    debug_log!("discovery complete");
 
     // Warn if API detection had errors (we'll have to detect APIs per-batch)
     if let Some(ref apis) = unsupported_apis {
@@ -444,6 +572,7 @@ fn spawn_test_discovery(
                         return;
                     }
                     if line.contains("Compiling core module") {
+                        debug_log!("stderr triggered compiling: {:?}", line);
                         let _ = compiling_tx.send(());
                     }
                 }
@@ -530,19 +659,14 @@ fn spawn_api_detection(tx: Sender<UnsupportedApis>, slang_test: PathBuf, root_di
         .spawn(move || {
         log_event(
             "api_check_start",
-            &format!(
-                "{} tests/compute/simple.slang -api cpu",
-                slang_test.display()
-            ),
+            &format!("{} -only-api-detection", slang_test.display()),
         );
 
-        // Start with platform defaults
-        let mut unsupported = UnsupportedApis::platform_defaults();
+        // Start fresh - no platform defaults, we get actual results from slang-test
+        let mut unsupported = UnsupportedApis::new();
 
         let child = Command::new(&slang_test)
-            .arg("tests/compute/simple.slang")
-            .arg("-api")
-            .arg("cpu")
+            .arg("-only-api-detection")
             .current_dir(&root_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -571,7 +695,7 @@ fn spawn_api_detection(tx: Sender<UnsupportedApis>, slang_test: PathBuf, root_di
 
         let reader = BufReader::new(stdout);
         let mut saw_any_check = false;
-        let mut last_check_time = std::time::Instant::now();
+        let mut saw_not_checked = false;
 
         for line in reader.lines() {
             let line = match line {
@@ -582,7 +706,6 @@ fn spawn_api_detection(tx: Sender<UnsupportedApis>, slang_test: PathBuf, root_di
             // Parse "Check vk,vulkan: Supported" or "Check dx12,d3d12: Not Supported"
             if line.starts_with("Check ") {
                 saw_any_check = true;
-                last_check_time = std::time::Instant::now();
 
                 if let Some(colon_pos) = line.find(':') {
                     let api_part = &line[6..colon_pos];
@@ -602,27 +725,31 @@ fn spawn_api_detection(tx: Sender<UnsupportedApis>, slang_test: PathBuf, root_di
                 continue;
             }
 
-            // Early exit after Check lines
-            if saw_any_check
-                && !line.starts_with("Check ")
-                && !line.starts_with("Supported backends:")
-            {
-                break;
-            }
-
-            // Timeout safety
-            if !saw_any_check && last_check_time.elapsed().as_secs() > 2 {
+            // Parse "Not checked: mtl wgpu" - mark these as unsupported and exit
+            if line.starts_with("Not checked:") {
+                let apis_part = &line[12..].trim();
+                for api in apis_part.split_whitespace() {
+                    unsupported.add_unsupported(api);
+                }
+                saw_not_checked = true;
+                // This is our sentinel - we're done
                 break;
             }
         }
 
-        // Kill the process since we're done early
-        let _ = child.kill();
+        // Send to reaper (process should exit quickly after "Not checked" line)
         reap_process_with_label(child, "api_check".to_string());
 
-        unsupported.check_completed = saw_any_check;
-        if !saw_any_check {
-            unsupported.error = Some("No Check lines found in slang-test output".to_string());
+        if saw_any_check && saw_not_checked {
+            // Modern slang-test with full API detection
+            unsupported.check_completed = true;
+        } else if !saw_any_check {
+            // Old slang-test or error - just warn and continue without API info
+            unsupported.check_completed = false;
+            eprintln!("{}", "Warning: slang-test does not support -only-api-detection, API detection skipped".dimmed());
+        } else {
+            // Saw some Check lines but no "Not checked" sentinel - partial result
+            unsupported.check_completed = false;
         }
 
         log_event(

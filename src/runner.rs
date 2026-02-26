@@ -14,38 +14,16 @@ use std::time::{Duration, Instant};
 use terminal_size::{terminal_size, Width};
 
 use crate::api::UnsupportedApis;
-use crate::discovery::{format_running_message, DiscoveryResult};
+use crate::debug_log;
+use crate::discovery::DiscoveryResult;
 use crate::event_log::log_event;
 use crate::progress::{ProgressDisplay, WorkerState, WorkerStates, SystemStats};
 use crate::scheduler::{Scheduler, SchedulerHandle};
 use crate::timing::{BuildType, TimingCache};
 use crate::types::{
     BatchContext, FailureInfo, TestId, TestOutcome, TestResult, TestStats,
-    DEFAULT_PREDICTED_DURATION, OUTPUT_TRUNCATE_LINES, test_to_timing_key,
+    DEBUG_START, DEFAULT_PREDICTED_DURATION, OUTPUT_TRUNCATE_LINES, test_to_timing_key,
 };
-
-// ============================================================================
-// Debug Logging
-// ============================================================================
-
-static DEBUG_ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("STI_DEBUG").is_ok());
-static DEBUG_START: LazyLock<Instant> = LazyLock::new(Instant::now);
-
-/// Print a debug message with timestamp and thread ID, only if STI_DEBUG is set
-macro_rules! debug_log {
-    ($($arg:tt)*) => {
-        if *DEBUG_ENABLED {
-            let thread_id = std::thread::current().id();
-            let thread_name = std::thread::current().name().unwrap_or("?").to_string();
-            eprintln!("{}", format!("[DEBUG {:>6.3}s] [{}:{}] {}",
-                DEBUG_START.elapsed().as_secs_f64(),
-                thread_name,
-                format!("{:?}", thread_id).trim_start_matches("ThreadId(").trim_end_matches(")"),
-                format!($($arg)*)
-            ).dimmed());
-        }
-    };
-}
 
 // ============================================================================
 // Diff Tool Resolution
@@ -1117,7 +1095,7 @@ impl TestRunner {
             eprintln!("{}", msg);
         } else {
             // Note: dry_run is handled in main.rs before creating TestRunner
-            self.run_file_tests(test_files, api_ignored, has_unknown_apis)?;
+            self.run_file_tests(test_files, has_unknown_apis)?;
         }
 
         let elapsed = start_time.elapsed();
@@ -1131,7 +1109,7 @@ impl TestRunner {
         Ok(self.stats.failed.load(Ordering::SeqCst) == 0 && !is_interrupted())
     }
 
-    fn run_file_tests(&self, test_files: &[String], api_ignored: usize, has_unknown_apis: bool) -> Result<()> {
+    fn run_file_tests(&self, test_files: &[String], has_unknown_apis: bool) -> Result<()> {
         if test_files.is_empty() {
             return Ok(());
         }
@@ -1222,25 +1200,7 @@ impl TestRunner {
             files
         };
 
-        let raw_eta = if has_timing_data {
-            Some(calculate_initial_eta(&predictions, effective_workers, effective_gpu_jobs))
-        } else {
-            None
-        };
-
-        let fudge_factor = if has_timing_data {
-            let cache = self.timing_cache.lock().unwrap();
-            self.build_type
-                .map(|bt| cache.average_fudge_factor(bt, test_files))
-                .unwrap_or(1.0)
-        } else {
-            1.0
-        };
-
-        let display_eta = raw_eta.map(|eta| eta * fudge_factor);
-        let running_msg = format_running_message(test_files.len(), effective_workers, display_eta, api_ignored);
-        eprintln!("{}", running_msg);
-
+        // Print additional warnings (main "Running X tests" line is printed by discovery)
         if let Some(ref unsupported) = self.unsupported_apis {
             if unsupported.gpu_disabled {
                 let apis = UnsupportedApis::disabled_gpu_apis();
@@ -1254,13 +1214,30 @@ impl TestRunner {
         if has_unknown_apis {
             let mut apis_list: Vec<_> = self.unknown_apis.iter().collect();
             apis_list.sort();
+            let apis_str = apis_list.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
             eprintln!("{}", format!(
-                "Warning: Found tests for unknown APIs {:?} - will not skip API detection in batch runs",
-                apis_list
+                "Warning: Found tests for unknown APIs ({}) - will not skip API detection in batch runs",
+                apis_str
             ).dimmed());
         }
 
         let skip_api_detection = self.skip_api_detection && !has_unknown_apis;
+
+        let raw_eta = if has_timing_data {
+            Some(calculate_initial_eta(&predictions, effective_workers, effective_gpu_jobs))
+        } else {
+            None
+        };
+
+        // Fudge factor for progress display ETA correction
+        let fudge_factor = if has_timing_data {
+            let cache = self.timing_cache.lock().unwrap();
+            self.build_type
+                .map(|bt| cache.average_fudge_factor(bt, test_files))
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
 
         if let Some(eta) = raw_eta {
             self.stats.record_initial_prediction(eta, test_files.to_vec());

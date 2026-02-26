@@ -251,7 +251,7 @@ Running 5494 tests with 32 workers (predicted 29s) (ignored 3053 tests on unsupp
 If tests are found for APIs that weren't in the Check output (unknown APIs), a warning is shown and `-skip-api-detection` is not used:
 
 ```
-Warning: Found tests for unknown APIs ["newapi"] - will not skip API detection in batch runs
+Warning: Found tests for unknown APIs (newapi) - will not skip API detection in batch runs
 ```
 
 ### Disabling

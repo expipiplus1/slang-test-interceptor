@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::scheduler::SchedulerHandle;
@@ -10,6 +10,30 @@ use crate::scheduler::SchedulerHandle;
 pub const DEFAULT_PREDICTED_DURATION: f64 = 0.5;
 pub const EMA_NEW_WEIGHT: f64 = 0.7;
 pub const OUTPUT_TRUNCATE_LINES: usize = 30;
+
+// ============================================================================
+// Debug Logging
+// ============================================================================
+
+pub static DEBUG_ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("STI_DEBUG").is_ok());
+pub static DEBUG_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Print a debug message with timestamp and thread ID, only if STI_DEBUG is set
+#[macro_export]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if *$crate::types::DEBUG_ENABLED {
+            let thread_id = std::thread::current().id();
+            let thread_name = std::thread::current().name().unwrap_or("?").to_string();
+            eprintln!("{}", format!("[DEBUG {:>6.3}s] [{}:{}] {}",
+                $crate::types::DEBUG_START.elapsed().as_secs_f64(),
+                thread_name,
+                format!("{:?}", thread_id).trim_start_matches("ThreadId(").trim_end_matches(")"),
+                format!($($arg)*)
+            ).dimmed());
+        }
+    };
+}
 
 // ============================================================================
 // Test Identifier

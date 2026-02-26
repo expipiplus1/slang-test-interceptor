@@ -83,7 +83,12 @@ impl UnsupportedApis {
         None
     }
 
-    /// Get platform-default unsupported APIs (before running actual check)
+    /// Get platform-default unsupported APIs based on OS.
+    ///
+    /// This is used purely for cosmetic purposes during discovery to show a conservative
+    /// test count before the real API detection completes. It does not affect which tests
+    /// actually run - that is determined by the real API detection or falls back to
+    /// running all tests if detection fails.
     pub fn platform_defaults() -> Self {
         let mut result = Self::new();
 
@@ -103,6 +108,10 @@ impl UnsupportedApis {
 
         #[cfg(target_os = "linux")]
         {
+            result.add_unsupported("dx11");
+            result.add_unsupported("dx12");
+            result.add_unsupported("d3d11");
+            result.add_unsupported("d3d12");
             // On Linux, Metal is not available
             result.add_unsupported("mtl");
             result.add_unsupported("metal");

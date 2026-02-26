@@ -13,6 +13,7 @@ use colored::Colorize;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
+use crate::types::DEBUG_START;
 use discovery::{run_concurrent_discovery, DiscoveryConfig};
 use runner::{set_interrupted, TestRunner};
 use event_log::{flush_event_log, init_event_log, log_event};
@@ -227,6 +228,10 @@ fn detect_slang_test_build(
 // ============================================================================
 
 fn main() -> Result<()> {
+    // Initialize debug timer at program start
+    let _ = *DEBUG_START;
+    debug_log!("program start");
+
     ctrlc::set_handler(|| {
         set_interrupted();
     })
