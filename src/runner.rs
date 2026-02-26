@@ -19,7 +19,7 @@ use crate::progress::{ProgressDisplay, WorkerState, WorkerStates, SystemStats, P
 use crate::scheduler::{Scheduler, SchedulerHandle};
 use crate::timing::{BuildType, TimingCache};
 use crate::types::{
-    BatchContext, FailureInfo, TestId, TestOutcome, TestResult, TestStats,
+    BatchContext, FailureContent, FailureInfo, TestId, TestOutcome, TestResult, TestStats,
     DEBUG_START, DEFAULT_PREDICTED_DURATION, OUTPUT_TRUNCATE_LINES, test_to_timing_key,
 };
 
@@ -339,11 +339,14 @@ pub fn parse_failure_info(test_name: &str, lines: &[String]) -> FailureInfo {
         }
     }
 
+    let content = match (expected, actual) {
+        (Some(expected), Some(actual)) => FailureContent::Diff { expected, actual },
+        _ => FailureContent::Output { lines: lines.to_vec() },
+    };
+
     FailureInfo {
         test_name: test_name.to_string(),
-        output_lines: lines.to_vec(),
-        expected,
-        actual,
+        content,
     }
 }
 
@@ -584,9 +587,7 @@ fn handle_incomplete_batch(
             };
             ctx.failures.lock().unwrap().push(FailureInfo {
                 test_name: test.clone(),
-                output_lines: vec![failure_msg],
-                expected: None,
-                actual: None,
+                content: FailureContent::Output { lines: vec![failure_msg] },
             });
 
             // Record timing for crashed/timed-out test using actual elapsed time
@@ -1750,13 +1751,37 @@ impl TestRunner {
             let mut sorted_failures: Vec<_> = failures.iter().collect();
             sorted_failures.sort_by(|a, b| a.test_name.cmp(&b.test_name));
 
+            // Group consecutive failures with identical content (compare before diffing)
+            struct FailureGroup<'a> {
+                test_names: Vec<&'a str>,
+                failure: &'a FailureInfo,
+            }
+
+            let mut groups: Vec<FailureGroup> = Vec::new();
+            for failure in &sorted_failures {
+                // FailureContent derives PartialEq, so we can compare directly
+                let should_group = groups.last().map_or(false, |last| {
+                    last.failure.content == failure.content
+                });
+
+                if should_group {
+                    groups.last_mut().unwrap().test_names.push(&failure.test_name);
+                } else {
+                    groups.push(FailureGroup {
+                        test_names: vec![&failure.test_name],
+                        failure,
+                    });
+                }
+            }
+
+            // Compute diffs only for the representative failure in each group (not per-failure)
             let diff_tool = resolve_diff_tool(self.args.diff.as_str());
             let machine_output = self.machine_output;
             let diff_results: Vec<Option<String>> = if diff_tool != "none" {
-                let handles: Vec<_> = sorted_failures
+                let handles: Vec<_> = groups
                     .iter()
-                    .map(|failure| {
-                        if let (Some(expected), Some(actual)) = (&failure.expected, &failure.actual) {
+                    .map(|group| {
+                        if let FailureContent::Diff { expected, actual } = &group.failure.content {
                             let expected = expected.clone();
                             let actual = actual.clone();
                             let tool = diff_tool.to_string();
@@ -1781,35 +1806,42 @@ impl TestRunner {
                     .map(|h| h.map(|handle| handle.join().unwrap_or_default()))
                     .collect()
             } else {
-                vec![None; sorted_failures.len()]
+                vec![None; groups.len()]
             };
 
-            for (failure, diff_output) in sorted_failures.iter().zip(diff_results.iter()) {
-                println!("\n{}", failure.test_name.red().bold().underline());
+            // Print grouped failures: all test names first, then the single diff
+            for (group, diff_output) in groups.iter().zip(diff_results.iter()) {
+                // Print all test names in this group
+                println!();
+                for test_name in &group.test_names {
+                    println!("{}", test_name.red().bold().underline());
+                }
 
-                if let (Some(expected), Some(actual)) = (&failure.expected, &failure.actual) {
-                    if let Some(diff) = diff_output {
-                        print!("{}", diff);
-                    } else {
-                        self.show_diff(expected, actual);
-                    }
-                } else if !failure.output_lines.is_empty() {
-                    let relevant_lines: Vec<_> = failure
-                        .output_lines
-                        .iter()
-                        .filter(|l| {
-                            !l.trim().is_empty()
-                                && !l.contains("Supported backends:")
-                                && !l.contains("Check ")
-                        })
-                        .take(OUTPUT_TRUNCATE_LINES)
-                        .collect();
-
-                    for line in relevant_lines {
-                        if self.machine_output {
-                            println!("{}", line);
+                match &group.failure.content {
+                    FailureContent::Diff { expected, actual } => {
+                        if let Some(diff) = diff_output {
+                            print!("{}", diff);
                         } else {
-                            println!("  {}", line.dimmed());
+                            self.show_diff(expected, actual);
+                        }
+                    }
+                    FailureContent::Output { lines } => {
+                        let relevant_lines: Vec<_> = lines
+                            .iter()
+                            .filter(|l| {
+                                !l.trim().is_empty()
+                                    && !l.contains("Supported backends:")
+                                    && !l.contains("Check ")
+                            })
+                            .take(OUTPUT_TRUNCATE_LINES)
+                            .collect();
+
+                        for line in relevant_lines {
+                            if self.machine_output {
+                                println!("{}", line);
+                            } else {
+                                println!("  {}", line.dimmed());
+                            }
                         }
                     }
                 }

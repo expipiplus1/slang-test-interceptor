@@ -347,12 +347,19 @@ impl TestStats {
     }
 }
 
+/// The displayable content of a test failure
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailureContent {
+    /// Failure with expected/actual content that can be diffed
+    Diff { expected: String, actual: String },
+    /// Failure with raw output lines (crash, timeout, etc.)
+    Output { lines: Vec<String> },
+}
+
 #[derive(Debug, Clone)]
 pub struct FailureInfo {
     pub test_name: String,
-    pub output_lines: Vec<String>,
-    pub expected: Option<String>,
-    pub actual: Option<String>,
+    pub content: FailureContent,
 }
 
 // ============================================================================
