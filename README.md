@@ -46,9 +46,9 @@ While the tests are running :
 
 ![sti running](./during-run.png)
 
-- `[in-flight/pending/total-tests]`
-- finished tests stats
-- Timing information
+- `[running/remaining/total]` - batches running, tests remaining in queue, total tests
+- Test counts (passed, failed, ignored)
+- Elapsed time and ETA
 
 ## Usage
 
@@ -84,7 +84,7 @@ sti --ignore-api cuda
 # Limit concurrent GPU tests
 sti -g 4
 
-# Run only CPU tests (skip all GPU tests)
+# Run only CPU tests
 sti -g 0
 ```
 
@@ -112,7 +112,6 @@ sti -g 0
 ### Advanced options
 
 - `--retries <N>` - Number of retries for failed tests (default: 2).
-- `--hide-ignored` - Hide ignored tests from output
 - `--batch-size <N>` - Maximum tests per slang-test invocation (default: auto-calculated as `(num_tests/jobs)*2` with timing data, or `min(50, num_tests/jobs)` without)
 - `--batch-duration <SECS>` - Target batch duration in seconds when timing data is available (default: auto-calculated as `predicted_runtime/2`, minimum 1.0)
 - `--no-timing-cache` - Ignore cached timing data for scheduling and ETA
@@ -122,31 +121,6 @@ sti -g 0
 - `--gpu-stagger <MS>` - GPU stagger increment in milliseconds (default: 100). The first N batches (N = jobs) have increasing amounts of CPU work at the start to stagger GPU test launches, reducing Vulkan context creation contention.
 
 When stderr is not a TTY (e.g., in CI or when piped), output automatically switches to machine-readable format: no carriage returns, no terminal clearing, sparse progress updates.
-
-## Output format
-
-During execution, a progress line updates in place showing:
-
-```
-[32/7786/7885] 0.0% | 0 passed, 0 failed, 0 ignored | Elapsed: 0.5s | ETA: 42.7s
-```
-
-- `[running/remaining/total]` - batches running, tests remaining in queue, total tests
-- Test counts (passed, failed, ignored)
-- Elapsed time and ETA
-
-When stderr is not a TTY (CI, piped output), progress is printed on separate lines at 10% intervals:
-
-```
-[32/7786/7885] 0.0% | 0 passed, 0 failed, 0 ignored | Elapsed: 0.5s | ETA: 42.7s
-```
-
-At completion, a summary shows:
-
-- Failed tests with details and diff output
-- Overall statistics
-- Slowest tests and batch histogram (verbose mode only)
-- Command to rerun failures
 
 ## Crash/Segfault Handling
 
@@ -244,44 +218,6 @@ Before discovering tests, the runner performs a quick check to determine which g
 2. **Parse results**: Lines like `Check vk,vulkan: Supported` and `Check dx12,d3d12: Not Supported` are parsed to build a list of unsupported APIs
 3. **Early filtering**: During test discovery, tests for unsupported APIs are filtered out and counted separately
 4. **Optimized batch runs**: When the API check succeeds, `-skip-api-detection` is passed to batch slang-test invocations since we already know which APIs are available
-
-### Platform defaults
-
-Some APIs are known to be unavailable on certain platforms:
-
-- **Linux**: Metal (`mtl`, `metal`) and WGPU (`wgpu`) are marked unsupported
-- **macOS**: DirectX (`dx11`, `dx12`, `d3d11`, `d3d12`) and WGPU (`wgpu`) are marked unsupported
-- **Windows**: Metal (`mtl`, `metal`) is marked unsupported
-- **All platforms**: CPU (`cpu`) is always marked as supported
-
-### Output
-
-The "Running X tests" message shows how many tests were filtered:
-
-```
-Running 5494 tests with 32 workers (predicted 29s) (ignored 3053 tests on unsupported APIs)
-```
-
-If tests are found for APIs that weren't in the Check output (unknown APIs), a warning is shown and `-skip-api-detection` is not used:
-
-```
-Warning: Found tests for unknown APIs (newapi) - will not skip API detection in batch runs
-```
-
-### Disabling
-
-Use `--no-early-api-check` to disable this feature and let each batch detect API support individually.
-
-## Core Module Compilation
-
-On debug builds of slang, the first invocation of slang-test compiles the core module which can take 10-20 seconds. The runner handles this automatically:
-
-1. All workers start immediately for maximum parallelism
-2. When "Compiling core module" is detected on stderr, the runner tracks which batch is compiling
-3. Other batches that aren't doing the compilation are killed and their files re-queued
-4. Once compilation completes, all workers resume normal execution
-
-This ensures only one process compiles the core module while minimizing wasted work.
 
 ## Ctrl-C Handling
 
