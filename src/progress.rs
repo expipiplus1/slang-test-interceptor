@@ -1,3 +1,4 @@
+use colored::control::SHOULD_COLORIZE;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use sysinfo::{CpuRefreshKind, RefreshKind, System};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -5,7 +6,34 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::event_log::log_event;
-use crate::types::{TestStats, DEBUG_ENABLED, DEBUG_START};
+use crate::types::{TestStats, DEBUG_START};
+
+/// Helper to conditionally apply ANSI dim code
+fn dim(s: &str) -> String {
+    if SHOULD_COLORIZE.should_colorize() {
+        format!("\x1b[2m{}\x1b[0m", s)
+    } else {
+        s.to_string()
+    }
+}
+
+/// Helper to conditionally apply ANSI green code
+fn green(s: &str) -> String {
+    if SHOULD_COLORIZE.should_colorize() {
+        format!("\x1b[32m{}\x1b[0m", s)
+    } else {
+        s.to_string()
+    }
+}
+
+/// Helper to conditionally apply ANSI red code
+fn red(s: &str) -> String {
+    if SHOULD_COLORIZE.should_colorize() {
+        format!("\x1b[31m{}\x1b[0m", s)
+    } else {
+        s.to_string()
+    }
+}
 
 /// Sentinel value meaning "no test running" (worker is idle or between batches)
 pub const WORKER_IDLE: usize = usize::MAX;
@@ -111,10 +139,6 @@ impl WorkerStates {
     }
 }
 
-/// Spring constant for ETA display smoothing.
-/// Higher = more responsive to target, lower = smoother.
-const ETA_SPRING_CONSTANT: f64 = 2.0;
-
 pub struct ProgressDisplay {
     total_files: usize,
     start_time: Instant,
@@ -136,14 +160,8 @@ pub struct ProgressDisplay {
     sys_query_counter: u32,
     /// Fudge factor for ETA display (actual/predicted from historical runs)
     eta_fudge_factor: f64,
-    /// Smoothed ETA for display (uses spring-based momentum)
-    displayed_eta: Option<f64>,
-    /// Previous target ETA (for calculating target velocity)
-    prev_target_eta: Option<f64>,
-    /// When we last updated the displayed ETA (for calculating dt)
-    last_eta_update: Instant,
-    /// Counter for throttling ETA debug output
-    eta_debug_counter: u32,
+    /// Initial ETA (for calculating time column width in machine output)
+    initial_eta: Option<f64>,
 }
 
 impl ProgressDisplay {
@@ -199,10 +217,19 @@ impl ProgressDisplay {
             sys: System::new_with_specifics(RefreshKind::new().with_cpu(CpuRefreshKind::everything())),
             sys_query_counter: 0,
             eta_fudge_factor,
-            displayed_eta: None,
-            prev_target_eta: None,
-            last_eta_update: Instant::now(),
-            eta_debug_counter: 0,
+            initial_eta: None,
+        }
+    }
+
+    /// Calculate time column width based on initial ETA (max 10x expected)
+    fn time_width(&self) -> usize {
+        match self.initial_eta {
+            Some(eta) => {
+                // Allow for 10x the initial ETA
+                let max_time = (eta * 10.0).max(10.0);
+                (max_time as usize).to_string().len()
+            }
+            None => 3, // Default fallback
         }
     }
 
@@ -218,69 +245,7 @@ impl ProgressDisplay {
         }
 
         // Apply fudge factor to ETA (historical actual/predicted ratio)
-        let target_eta = eta_seconds.map(|eta| eta * self.eta_fudge_factor);
-
-        // Spring-based smoothing for ETA display
-        // This gives the display "momentum" - it naturally counts down at 1s/s
-        // and is gently pulled toward the target ETA like a spring
-        let adjusted_eta = if let Some(target) = target_eta {
-            let now = Instant::now();
-            let dt = now.duration_since(self.last_eta_update).as_secs_f64();
-            self.last_eta_update = now;
-
-            let displayed = match (self.displayed_eta, self.prev_target_eta) {
-                (Some(current), Some(prev_target)) if dt < 1.0 && dt > 0.0 => {
-                    // Calculate target's velocity (how fast the calculated ETA is changing)
-                    let target_velocity = (target - prev_target) / dt;
-
-                    // Natural velocity: follow target's rate of change, but ensure at least
-                    // a minimum countdown rate so the user sees progress.
-                    // Scale minimum with current ETA: ~1%/s for long ETAs, slower for short ones.
-                    // This is partly aesthetic - keeps something spinning for the user.
-                    let min_countdown_rate = (current * 0.01).clamp(0.05, 0.5);
-                    let natural_velocity = target_velocity.min(-min_countdown_rate);
-
-                    // Spring physics:
-                    // - Spring force: pulls toward target proportionally to distance
-                    // - Velocity can slow down (spring pulls back) but never reverse (always <= 0)
-                    // - Final velocity must be at least the minimum countdown rate
-                    let spring_force = ETA_SPRING_CONSTANT * (target - current);
-
-                    // Clamp velocity: non-positive (never increase) but at least min countdown rate
-                    let velocity = (natural_velocity + spring_force)
-                        .min(0.0)
-                        .min(-min_countdown_rate);
-                    let new_value = (current + velocity * dt).max(0.0);
-
-                    // Debug output (only when STI_DEBUG is set)
-                    if *DEBUG_ENABLED {
-                        self.eta_debug_counter += 1;
-                        // Log every ~500ms (500ms / 16ms per update ≈ 31 updates)
-                        if self.eta_debug_counter >= 31 {
-                            self.eta_debug_counter = 0;
-                            let stuck = velocity.abs() < 0.1 && (target - new_value).abs() > 0.5;
-                            eprintln!(
-                                "[ETA-display] displayed={:.2}s target={:.2}s vel={:.2}/s t_vel={:.2}/s spring={:.2}{}",
-                                new_value, target, velocity, target_velocity, spring_force,
-                                if stuck { " STUCK" } else { "" }
-                            );
-                        }
-                    }
-
-                    new_value
-                }
-                _ => {
-                    // First update or large time gap - jump to target
-                    target
-                }
-            };
-            self.displayed_eta = Some(displayed);
-            self.prev_target_eta = Some(target);
-            Some(displayed)
-        } else {
-            self.displayed_eta = None;
-            None
-        };
+        let adjusted_eta = eta_seconds.map(|eta| eta * self.eta_fudge_factor);
 
         let passed = stats.passed.load(Ordering::SeqCst);
         let failed = stats.failed.load(Ordering::SeqCst);
@@ -293,52 +258,62 @@ impl ProgressDisplay {
             // Report at 0%, every 3 seconds, and at 99%
             let elapsed_ms = (elapsed * 1000.0) as usize;
             let last_report_ms = self.last_report_time_ms.load(Ordering::SeqCst);
-            let milestones = self.reported_milestones.load(Ordering::SeqCst);
-            let reported_0 = milestones & 1 != 0;
-            let reported_99 = milestones & 2 != 0;
+            let reported_0 = self.reported_milestones.load(Ordering::SeqCst) & 1 != 0;
 
-            let percent = (tests_done as f64 / self.total_files.max(1) as f64) * 100.0;
-            let at_99_pct = percent >= 99.0 && tests_done < self.total_files;
+            let mut percent = (tests_done as f64 / self.total_files.max(1) as f64) * 100.0;
+            // Cap at 99.9% while batches are still running
+            if batches_running > 0 && percent >= 100.0 {
+                percent = 99.9;
+            }
 
             let should_report = if !reported_0 {
                 true  // First report (0%)
-            } else if at_99_pct && !reported_99 {
-                true  // Report at 99%
             } else {
-                elapsed_ms >= last_report_ms + 500  // Every 500ms (for debugging)
+                elapsed_ms >= last_report_ms + 3000  // Every 3 seconds
             };
 
             if should_report {
                 self.last_report_time_ms.store(elapsed_ms, Ordering::SeqCst);
-                let new_milestones = milestones | 1 | if at_99_pct { 2 } else { 0 };
-                self.reported_milestones.store(new_milestones, Ordering::SeqCst);
+                self.reported_milestones.store(1, Ordering::SeqCst);
 
-                // Calculate column widths based on total_files
+                // Capture initial ETA for column width calculation
+                if self.initial_eta.is_none() {
+                    if let Some(eta) = adjusted_eta {
+                        self.initial_eta = Some(eta);
+                    }
+                }
+
+                // Calculate column widths
                 let count_width = self.total_files.max(1).to_string().len();
+                let time_width = self.time_width();
 
                 let eta = match adjusted_eta {
-                    Some(secs) if secs > 1.0 => format!(" \x1b[2m|\x1b[0m ETA: {:>4.0}s", secs),
-                    Some(_) => " \x1b[2m|\x1b[0m ETA:    <1s".to_string(),
+                    Some(secs) if secs > 1.0 => format!(" | ETA: {:>w$.0}s", secs.ceil(), w = time_width),
+                    Some(_) => format!(" | ETA: {:>w$}", "<1s", w = time_width),
                     None => String::new(),
                 };
                 eprintln!(
-                    "[{:>2}/{:>w$}/{:>w$}] {:>5.1}% \x1b[2m|\x1b[0m {:>w$} passed, {:>w$} failed, {:>w$} ignored \x1b[2m|\x1b[0m Elapsed: {:>6.1}s{}",
+                    "[{:>2}/{:>cw$}/{:>cw$}] {:>5.1}% | {:>cw$} passed, {:>cw$} failed, {:>cw$} ignored | Elapsed: {:>tw$.0}s{}",
                     batches_running, tests_remaining, self.total_files,
-                    percent, passed, failed, ignored, elapsed, eta,
-                    w = count_width
+                    percent, passed, failed, ignored, elapsed.round(), eta,
+                    cw = count_width, tw = time_width
                 );
             }
         } else if let Some(ref pb) = self.main_progress_bar {
             // Percentage based on tests completed vs total
-            let percent = (tests_done as f64 / self.total_files.max(1) as f64) * 100.0;
+            let mut percent = (tests_done as f64 / self.total_files.max(1) as f64) * 100.0;
+            // Cap at 99.9% while batches are still running
+            if batches_running > 0 && percent >= 100.0 {
+                percent = 99.9;
+            }
 
-            // Format ETA string (velocity-adjusted)
+            // Format ETA string
             let eta = match adjusted_eta {
                 Some(secs) if secs > 1.0 && tests_remaining > 0 => {
-                    format!(" \x1b[2m|\x1b[0m ETA: {:.0}s", secs)
+                    format!(" {}", dim(&format!("| ETA: {:.0}s", secs.ceil())))
                 }
                 Some(_) if tests_remaining > 0 => {
-                    " \x1b[2m|\x1b[0m ETA: <1s".to_string()
+                    format!(" {}", dim("| ETA: <1s"))
                 }
                 _ => String::new(),
             };
@@ -351,7 +326,7 @@ impl ProgressDisplay {
 
             let stuck_info = if let Some(secs) = stats.seconds_since_last_output() {
                 if secs >= 5.0 {
-                    format!(" \x1b[2m[no output for {:.0}s]\x1b[0m", secs)
+                    format!(" {}", dim(&format!("[no output for {:.0}s]", secs)))
                 } else {
                     String::new()
                 }
@@ -361,18 +336,31 @@ impl ProgressDisplay {
 
             let load_info = if self.verbose {
                 match self.last_gpu_load {
-                    Some(gpu) => format!(" \x1b[2m|\x1b[0m CPU: {:.0}% GPU: {}%", self.last_cpu_load, gpu),
-                    None if self.last_cpu_load > 0.0 => format!(" \x1b[2m|\x1b[0m CPU: {:.0}%", self.last_cpu_load),
+                    Some(gpu) => format!(" {} CPU: {:.0}% GPU: {}%", dim("|"), self.last_cpu_load, gpu),
+                    None if self.last_cpu_load > 0.0 => format!(" {} CPU: {:.0}%", dim("|"), self.last_cpu_load),
                     None => String::new(),
                 }
             } else {
                 String::new()
             };
 
+            // Colorize counts: green for passed, red for failed (only if non-zero)
+            let passed_str = if passed > 0 {
+                green(&format!("{} passed", passed))
+            } else {
+                format!("{} passed", passed)
+            };
+            let failed_str = if failed > 0 {
+                red(&format!("{} failed", failed))
+            } else {
+                format!("{} failed", failed)
+            };
+
             let msg = format!(
-                "[{}/{}/{}] {:.1}% \x1b[2m|\x1b[0m {} passed, {} failed, {} ignored \x1b[2m|\x1b[0m Elapsed: {:.1}s{}{}{}{}",
+                "[{}/{}/{}] {:.1}% {} {}, {}, {} ignored {}{}{}{}{}",
                 batches_running, tests_remaining, self.total_files,
-                percent, passed, failed, ignored, elapsed,
+                percent, dim("|"), passed_str, failed_str, ignored,
+                dim(&format!("| Elapsed: {:.1}s", elapsed)),
                 eta, load_info, compiling_info, stuck_info
             );
             pb.set_message(msg);
@@ -420,10 +408,11 @@ impl ProgressDisplay {
             let ignored = stats.ignored.load(Ordering::SeqCst);
             let elapsed = self.start_time.elapsed().as_secs_f64();
             let count_width = self.total_files.max(1).to_string().len();
+            let time_width = self.time_width();
             eprintln!(
-                "[ 0/{:>w$}/{:>w$}] 100.0% \x1b[2m|\x1b[0m {:>w$} passed, {:>w$} failed, {:>w$} ignored \x1b[2m|\x1b[0m Elapsed: {:>6.1}s \x1b[2m|\x1b[0m",
-                0, self.total_files, passed, failed, ignored, elapsed,
-                w = count_width
+                "[ 0/{:>cw$}/{:>cw$}] 100.0% | {:>cw$} passed, {:>cw$} failed, {:>cw$} ignored | Elapsed: {:>tw$.0}s",
+                0, self.total_files, passed, failed, ignored, elapsed.round(),
+                cw = count_width, tw = time_width
             );
         }
     }

@@ -1284,8 +1284,6 @@ fn spawn_progress_thread(
 
             let status = scheduler_handle.get_status();
             let eta = if scheduler_handle.has_timing_data {
-                // Record prediction for accuracy analysis (before fudge factor)
-                stats.record_eta_prediction(status.eta);
                 Some(status.eta)
             } else {
                 None
@@ -1732,10 +1730,12 @@ impl TestRunner {
             let _ = af.write_all(actual.as_bytes());
 
             // Build command based on tool
+            // Only use color when outputting to a terminal (not machine_output)
+            let color_arg = if machine_output { "never" } else { "always" };
             let output = match tool {
                 "difft" => {
                     let mut cmd = Command::new("difft");
-                    cmd.arg("--color").arg("always");
+                    cmd.arg("--color").arg(color_arg);
                     if let Some(w) = *TERM_WIDTH {
                         if !machine_output {
                             cmd.arg("--width").arg(w.to_string());
@@ -1745,7 +1745,8 @@ impl TestRunner {
                 }
                 "git" => {
                     Command::new("git")
-                        .args(["--no-pager", "diff", "--no-ext-diff", "--no-index", "--color=always"])
+                        .args(["--no-pager", "diff", "--no-ext-diff", "--no-index"])
+                        .arg(format!("--color={}", color_arg))
                         .arg(&expected_file)
                         .arg(&actual_file)
                         .output()
@@ -1753,7 +1754,8 @@ impl TestRunner {
                 _ => {
                     // diff -u
                     Command::new("diff")
-                        .args(["-u", "--color=always"])
+                        .arg("-u")
+                        .arg(format!("--color={}", color_arg))
                         .arg(&expected_file)
                         .arg(&actual_file)
                         .output()
@@ -1921,12 +1923,24 @@ impl TestRunner {
         let not_run = total_tests.saturating_sub(passed + failed + ignored);
 
         if total_run > 0 {
+            // Colorize counts when non-zero
+            let passed_str = if passed > 0 {
+                passed.to_string().green().to_string()
+            } else {
+                passed.to_string()
+            };
+            let failed_str = if failed > 0 {
+                failed.to_string().red().to_string()
+            } else {
+                failed.to_string()
+            };
+
             if interrupted {
                 if failed == 0 {
                     println!(
                         "{}: {} passed, {} ignored, {} not run in {:.1}s",
                         "Interrupted".yellow().bold(),
-                        passed,
+                        passed_str,
                         ignored,
                         not_run,
                         elapsed.as_secs_f64()
@@ -1935,8 +1949,8 @@ impl TestRunner {
                     println!(
                         "{}: {} passed, {} failed, {} ignored, {} not run in {:.1}s",
                         "Interrupted".yellow().bold(),
-                        passed,
-                        failed,
+                        passed_str,
+                        failed_str,
                         ignored,
                         not_run,
                         elapsed.as_secs_f64()
@@ -1957,7 +1971,7 @@ impl TestRunner {
                         "{}: {}% passed ({} passed, {} ignored) in {:.1}s",
                         "OK".green().bold(),
                         pct_str,
-                        passed,
+                        passed_str,
                         ignored,
                         elapsed.as_secs_f64()
                     );
@@ -1966,8 +1980,8 @@ impl TestRunner {
                         "{}: {}% passed ({} passed, {} failed, {} ignored) in {:.1}s",
                         "FAILED".red().bold(),
                         pct_str,
-                        passed,
-                        failed,
+                        passed_str,
+                        failed_str,
                         ignored,
                         elapsed.as_secs_f64()
                     );
@@ -1982,26 +1996,6 @@ impl TestRunner {
                 println!("({} tests passed after retry)", retried);
             } else {
                 println!("  ({} tests passed after retry)", retried);
-            }
-        }
-
-        // Print ETA accuracy metrics (only if we had predictions)
-        if let Some((avg_error, worst_error, num_predictions)) = self.stats.analyze_eta_accuracy(elapsed.as_secs_f64()) {
-            if num_predictions >= 3 {  // Only show if we have enough data points
-                let accuracy_str = if avg_error <= 10.0 {
-                    "excellent".green()
-                } else if avg_error <= 25.0 {
-                    "good".yellow()
-                } else {
-                    "needs calibration".red()
-                };
-                if self.args.verbose || avg_error > 25.0 {
-                    // Show accuracy if verbose or if predictions are significantly off
-                    println!(
-                        "  ETA accuracy: avg {:.0}% error, worst {:.0}% error ({} samples - {})",
-                        avg_error, worst_error, num_predictions, accuracy_str
-                    );
-                }
             }
         }
 

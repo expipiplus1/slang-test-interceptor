@@ -4,8 +4,6 @@
 
 A wrapper for slang-test which implements several enhancements.
 
-> All stats and findings are from my machine, 7950X3D, 96GB, RTX 4090, Linux.
-
 ## It's more robust than `slang-test`.
 
 `slang-test -j32` reliably fails before completing the test suite when one of the test servers dies unexpectedly.
@@ -13,6 +11,8 @@ A wrapper for slang-test which implements several enhancements.
 `sti` will detect the crash of a worker and reschedule any unaccounted for tests, marking the crashing test as failed.
 
 ## It's much faster than `slang-test`.
+
+> (All stats and findings are from my machine, 7950X3D, 96GB, RTX 4090, Linux.)
 
 |                     | `slang-test` | `sti`       |
 | ------------------- | ------------ | ----------- |

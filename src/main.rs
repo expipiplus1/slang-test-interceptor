@@ -121,6 +121,10 @@ pub struct Args {
     #[arg(long)]
     pub no_early_api_check: bool,
 
+    /// Color mode: auto (default), always, or never
+    #[arg(long, default_value = "auto")]
+    pub color: String,
+
     // ---- Internal fields (not CLI args) ----
     /// The original -C argument as provided (for rerun command)
     #[arg(skip)]
@@ -235,6 +239,13 @@ fn main() -> Result<()> {
     .expect("Error setting Ctrl-C handler");
 
     let mut args = Args::parse();
+
+    // Set color mode based on --color argument
+    match args.color.as_str() {
+        "always" => colored::control::set_override(true),
+        "never" => colored::control::set_override(false),
+        "auto" | _ => {} // auto: let colored detect terminal
+    }
 
     // Validate job counts
     if args.jobs == 0 {

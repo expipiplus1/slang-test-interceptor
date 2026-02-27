@@ -319,6 +319,7 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
                 } else if let Some(ref pb) = discovery_pb {
                     pb.set_message(msg);
                 }
+                // machine_output: only print final message (handled at end of discovery)
             } else if is_compiling {
                 // Compiling before any tests arrived - show compiling message
                 let compiling_secs = compiling_started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
@@ -329,6 +330,7 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
                 } else if let Some(ref pb) = discovery_pb {
                     pb.set_message(msg);
                 }
+                // machine_output: only print final message (handled at end of discovery)
             }
             dirty = false;
         }
@@ -536,14 +538,14 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
     // Finish progress bar and print final summary with newline
     if let Some(pb) = discovery_pb {
         pb.finish_and_clear();
-        // Only print final "Running X tests" message if not interrupted
-        if !is_interrupted() {
-            let displayed_workers = config.num_workers.min(filtered_tests.len().max(1));
-            let has_timing = !timing_cache.timings_by_build.is_empty();
-            let eta = compute_display_eta(total_predicted, longest_test, displayed_workers, fudge_factor, has_timing);
-            // Final message never shows compiling (discovery is done)
-            eprintln!("{}", format_running_message(filtered_tests.len(), displayed_workers, eta, api_ignored_count, None));
-        }
+    }
+    // Print final "Running X tests" message (both TTY and machine output)
+    if !is_interrupted() {
+        let displayed_workers = config.num_workers.min(filtered_tests.len().max(1));
+        let has_timing = !timing_cache.timings_by_build.is_empty();
+        let eta = compute_display_eta(total_predicted, longest_test, displayed_workers, fudge_factor, has_timing);
+        // Final message never shows compiling (discovery is done)
+        eprintln!("{}", format_running_message(filtered_tests.len(), displayed_workers, eta, api_ignored_count, None));
     }
 
     debug_log!("discovery complete");
