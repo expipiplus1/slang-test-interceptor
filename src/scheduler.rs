@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::types::{BatchKind, TestId, DEFAULT_PREDICTED_DURATION};
@@ -77,6 +77,8 @@ pub struct Scheduler {
     batches: Vec<BatchWithKind>,
     /// Pending files that need to be rebuilt into batches
     pending_files: Vec<String>,
+    /// Set for O(1) duplicate checking when adding to pending_files
+    pending_set: HashSet<String>,
     /// In-flight batches keyed by batch ID
     in_flight: HashMap<usize, InFlightBatch>,
     /// Counter for generating batch IDs
@@ -142,6 +144,7 @@ impl Scheduler {
             rx,
             batches,
             pending_files: Vec::new(),
+            pending_set: HashSet::new(),
             in_flight: HashMap::new(),
             next_batch_id: 0,
             pool_predicted: total_predicted,
@@ -392,11 +395,16 @@ impl Scheduler {
     }
 
     /// Add tests back to the pool (for retries or repooled tests after crash).
+    /// Deduplicates using pending_set to handle cases where slang-test outputs
+    /// multiple FAILED lines for the same test.
     fn add_tests(&mut self, tests: Vec<String>) {
         for file in tests {
-            let predicted = self.predictions.get(&file).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-            self.pool_predicted += predicted;
-            self.pending_files.push(file);
+            // O(1) duplicate check using HashSet
+            if self.pending_set.insert(file.clone()) {
+                let predicted = self.predictions.get(&file).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                self.pool_predicted += predicted;
+                self.pending_files.push(file);
+            }
         }
     }
 
@@ -484,6 +492,7 @@ impl Scheduler {
         if !self.pending_files.is_empty() {
             // Collect all remaining tests: pending + already batched
             let mut all_files: Vec<String> = std::mem::take(&mut self.pending_files);
+            self.pending_set.clear(); // Clear set since pending_files is drained
             for batch in self.batches.drain(..) {
                 all_files.extend(batch.tests);
             }
