@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::event_log::log_event;
-use crate::types::{TestStats, DEBUG_START};
+use crate::types::{TestStats, DEBUG_ENABLED, DEBUG_START};
 
 /// Sentinel value meaning "no test running" (worker is idle or between batches)
 pub const WORKER_IDLE: usize = usize::MAX;
@@ -111,6 +111,10 @@ impl WorkerStates {
     }
 }
 
+/// Spring constant for ETA display smoothing.
+/// Higher = more responsive to target, lower = smoother.
+const ETA_SPRING_CONSTANT: f64 = 2.0;
+
 pub struct ProgressDisplay {
     total_files: usize,
     start_time: Instant,
@@ -132,6 +136,14 @@ pub struct ProgressDisplay {
     sys_query_counter: u32,
     /// Fudge factor for ETA display (actual/predicted from historical runs)
     eta_fudge_factor: f64,
+    /// Smoothed ETA for display (uses spring-based momentum)
+    displayed_eta: Option<f64>,
+    /// Previous target ETA (for calculating target velocity)
+    prev_target_eta: Option<f64>,
+    /// When we last updated the displayed ETA (for calculating dt)
+    last_eta_update: Instant,
+    /// Counter for throttling ETA debug output
+    eta_debug_counter: u32,
 }
 
 impl ProgressDisplay {
@@ -187,6 +199,10 @@ impl ProgressDisplay {
             sys: System::new_with_specifics(RefreshKind::new().with_cpu(CpuRefreshKind::everything())),
             sys_query_counter: 0,
             eta_fudge_factor,
+            displayed_eta: None,
+            prev_target_eta: None,
+            last_eta_update: Instant::now(),
+            eta_debug_counter: 0,
         }
     }
 
@@ -202,7 +218,69 @@ impl ProgressDisplay {
         }
 
         // Apply fudge factor to ETA (historical actual/predicted ratio)
-        let adjusted_eta = eta_seconds.map(|eta| eta * self.eta_fudge_factor);
+        let target_eta = eta_seconds.map(|eta| eta * self.eta_fudge_factor);
+
+        // Spring-based smoothing for ETA display
+        // This gives the display "momentum" - it naturally counts down at 1s/s
+        // and is gently pulled toward the target ETA like a spring
+        let adjusted_eta = if let Some(target) = target_eta {
+            let now = Instant::now();
+            let dt = now.duration_since(self.last_eta_update).as_secs_f64();
+            self.last_eta_update = now;
+
+            let displayed = match (self.displayed_eta, self.prev_target_eta) {
+                (Some(current), Some(prev_target)) if dt < 1.0 && dt > 0.0 => {
+                    // Calculate target's velocity (how fast the calculated ETA is changing)
+                    let target_velocity = (target - prev_target) / dt;
+
+                    // Natural velocity: follow target's rate of change, but ensure at least
+                    // a minimum countdown rate so the user sees progress.
+                    // Scale minimum with current ETA: ~1%/s for long ETAs, slower for short ones.
+                    // This is partly aesthetic - keeps something spinning for the user.
+                    let min_countdown_rate = (current * 0.01).clamp(0.05, 0.5);
+                    let natural_velocity = target_velocity.min(-min_countdown_rate);
+
+                    // Spring physics:
+                    // - Spring force: pulls toward target proportionally to distance
+                    // - Velocity can slow down (spring pulls back) but never reverse (always <= 0)
+                    // - Final velocity must be at least the minimum countdown rate
+                    let spring_force = ETA_SPRING_CONSTANT * (target - current);
+
+                    // Clamp velocity: non-positive (never increase) but at least min countdown rate
+                    let velocity = (natural_velocity + spring_force)
+                        .min(0.0)
+                        .min(-min_countdown_rate);
+                    let new_value = (current + velocity * dt).max(0.0);
+
+                    // Debug output (only when STI_DEBUG is set)
+                    if *DEBUG_ENABLED {
+                        self.eta_debug_counter += 1;
+                        // Log every ~500ms (500ms / 16ms per update ≈ 31 updates)
+                        if self.eta_debug_counter >= 31 {
+                            self.eta_debug_counter = 0;
+                            let stuck = velocity.abs() < 0.1 && (target - new_value).abs() > 0.5;
+                            eprintln!(
+                                "[ETA-display] displayed={:.2}s target={:.2}s vel={:.2}/s t_vel={:.2}/s spring={:.2}{}",
+                                new_value, target, velocity, target_velocity, spring_force,
+                                if stuck { " STUCK" } else { "" }
+                            );
+                        }
+                    }
+
+                    new_value
+                }
+                _ => {
+                    // First update or large time gap - jump to target
+                    target
+                }
+            };
+            self.displayed_eta = Some(displayed);
+            self.prev_target_eta = Some(target);
+            Some(displayed)
+        } else {
+            self.displayed_eta = None;
+            None
+        };
 
         let passed = stats.passed.load(Ordering::SeqCst);
         let failed = stats.failed.load(Ordering::SeqCst);
