@@ -288,9 +288,8 @@ impl ProgressDisplay {
                 let time_width = self.time_width();
 
                 let eta = match adjusted_eta {
-                    Some(secs) if secs > 1.0 => format!(" | ETA: {:>w$.0}s", secs.ceil(), w = time_width),
-                    Some(_) => format!(" | ETA: {:>w$}", "<1s", w = time_width),
-                    None => String::new(),
+                    Some(secs) if secs >= 1.0 => format!(" | ETA: {:>w$.0}s", secs.ceil(), w = time_width),
+                    _ => String::new(),
                 };
                 eprintln!(
                     "[{:>2}/{:>cw$}/{:>cw$}] {:>5.1}% | {:>cw$} passed, {:>cw$} failed, {:>cw$} ignored | Elapsed: {:>tw$.0}s{}",
@@ -336,15 +335,15 @@ impl ProgressDisplay {
 
             let load_info = if self.verbose {
                 match self.last_gpu_load {
-                    Some(gpu) => format!(" {} CPU: {:.0}% GPU: {}%", dim("|"), self.last_cpu_load, gpu),
-                    None if self.last_cpu_load > 0.0 => format!(" {} CPU: {:.0}%", dim("|"), self.last_cpu_load),
+                    Some(gpu) => format!(" {}", dim(&format!("| CPU: {:.0}% GPU: {}%", self.last_cpu_load, gpu))),
+                    None if self.last_cpu_load > 0.0 => format!(" {}", dim(&format!("| CPU: {:.0}%", self.last_cpu_load))),
                     None => String::new(),
                 }
             } else {
                 String::new()
             };
 
-            // Colorize counts: green for passed, red for failed (only if non-zero)
+            // Colorize counts: green for passed, red for failed, dim for ignored (only if non-zero)
             let passed_str = if passed > 0 {
                 green(&format!("{} passed", passed))
             } else {
@@ -355,11 +354,12 @@ impl ProgressDisplay {
             } else {
                 format!("{} failed", failed)
             };
+            let ignored_str = format!("{} ignored", ignored);
 
             let msg = format!(
-                "[{}/{}/{}] {:.1}% {} {}, {}, {} ignored {}{}{}{}{}",
+                "[{}/{}/{}] {:.1}% {} {}, {}, {} {}{}{}{}{}",
                 batches_running, tests_remaining, self.total_files,
-                percent, dim("|"), passed_str, failed_str, ignored,
+                percent, dim("|"), passed_str, failed_str, ignored_str,
                 dim(&format!("| Elapsed: {:.1}s", elapsed)),
                 eta, load_info, compiling_info, stuck_info
             );

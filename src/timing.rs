@@ -11,6 +11,7 @@ pub enum BuildType {
     Debug,
     Release,
     RelWithDebInfo,
+    MinSizeRel,
 }
 
 impl BuildType {
@@ -19,6 +20,8 @@ impl BuildType {
         let path_str = path.to_string_lossy().to_lowercase();
         if path_str.contains("relwithdebinfo") {
             Some(BuildType::RelWithDebInfo)
+        } else if path_str.contains("minsizerel") {
+            Some(BuildType::MinSizeRel)
         } else if path_str.contains("debug") {
             Some(BuildType::Debug)
         } else if path_str.contains("release") {
@@ -35,6 +38,7 @@ impl std::fmt::Display for BuildType {
             BuildType::Debug => write!(f, "debug"),
             BuildType::Release => write!(f, "release"),
             BuildType::RelWithDebInfo => write!(f, "relwithdebinfo"),
+            BuildType::MinSizeRel => write!(f, "minsizerel"),
         }
     }
 }

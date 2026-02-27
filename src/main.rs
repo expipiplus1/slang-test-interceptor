@@ -8,7 +8,7 @@ mod timing;
 mod types;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use colored::Colorize;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -19,12 +19,54 @@ use runner::{set_interrupted, TestRunner};
 use event_log::{flush_event_log, init_event_log, log_event};
 
 // ============================================================================
+// CLI Enums
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ColorMode {
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DiffTool {
+    None,
+    Diff,
+    Git,
+    Difft,
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BuildType {
+    Debug,
+    Release,
+    #[value(name = "relwithdebinfo")]
+    RelWithDebInfo,
+    #[value(name = "minsizerel")]
+    MinSizeRel,
+}
+
+impl std::fmt::Display for BuildType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildType::Debug => write!(f, "debug"),
+            BuildType::Release => write!(f, "release"),
+            BuildType::RelWithDebInfo => write!(f, "relwithdebinfo"),
+            BuildType::MinSizeRel => write!(f, "minsizerel"),
+        }
+    }
+}
+
+// ============================================================================
 // CLI Arguments
 // ============================================================================
 
 #[derive(Parser, Debug)]
 #[command(name = "sti")]
 #[command(about = "A parallel test runner for slang-test with better output")]
+#[command(max_term_width = 80)]
 pub struct Args {
     /// Root directory of the slang project (defaults to current directory)
     #[arg(short = 'C', long)]
@@ -35,10 +77,9 @@ pub struct Args {
     #[arg(long)]
     pub slang_test: Option<PathBuf>,
 
-    /// Build type to use: debug, release, or relwithdebinfo
-    /// If not specified, uses the newest available build
-    #[arg(long)]
-    pub build_type: Option<String>,
+    /// Build type to use (default: newest available)
+    #[arg(long, value_enum)]
+    pub build_type: Option<BuildType>,
 
     /// Number of parallel workers
     #[arg(short = 'j', long, default_value_t = num_cpus())]
@@ -80,10 +121,9 @@ pub struct Args {
     #[arg(long = "ignore-api")]
     pub ignore_apis: Vec<String>,
 
-    /// Diff tool for showing expected/actual differences: difft, git, diff, none, auto
-    /// (default: auto, fallback chain: difft → git → diff → none)
-    #[arg(long, default_value = "auto")]
-    pub diff: String,
+    /// Diff tool for showing expected/actual differences
+    #[arg(long, value_enum, default_value_t = DiffTool::Auto)]
+    pub diff: DiffTool,
 
     /// Additional arguments to pass to slang-test
     #[arg(last = true)]
@@ -121,9 +161,9 @@ pub struct Args {
     #[arg(long)]
     pub no_early_api_check: bool,
 
-    /// Color mode: auto (default), always, or never
-    #[arg(long, default_value = "auto")]
-    pub color: String,
+    /// Color output mode
+    #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+    pub color: ColorMode,
 
     // ---- Internal fields (not CLI args) ----
     /// The original -C argument as provided (for rerun command)
@@ -162,6 +202,7 @@ fn detect_slang_test_build(
         ("debug", "build/Debug/bin/slang-test"),
         ("release", "build/Release/bin/slang-test"),
         ("relwithdebinfo", "build/RelWithDebInfo/bin/slang-test"),
+        ("minsizerel", "build/MinSizeRel/bin/slang-test"),
     ];
 
     let mut available: Vec<(String, PathBuf, std::time::SystemTime)> = Vec::new();
@@ -179,7 +220,7 @@ fn detect_slang_test_build(
 
     if available.is_empty() {
         anyhow::bail!(
-            "No slang-test executable found in build/{{Debug,Release,RelWithDebInfo}}/bin/"
+            "No slang-test executable found in build/{{Debug,Release,RelWithDebInfo,MinSizeRel}}/bin/"
         );
     }
 
@@ -241,10 +282,10 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
 
     // Set color mode based on --color argument
-    match args.color.as_str() {
-        "always" => colored::control::set_override(true),
-        "never" => colored::control::set_override(false),
-        "auto" | _ => {} // auto: let colored detect terminal
+    match args.color {
+        ColorMode::Always => colored::control::set_override(true),
+        ColorMode::Never => colored::control::set_override(false),
+        ColorMode::Auto => {} // let colored detect terminal
     }
 
     // Validate job counts
@@ -290,8 +331,14 @@ fn main() -> Result<()> {
         // (let Command::new handle PATH lookup for bare names like "slang-test")
         path
     } else {
+        let preferred = args.build_type.map(|bt| match bt {
+            BuildType::Debug => "debug",
+            BuildType::Release => "release",
+            BuildType::RelWithDebInfo => "relwithdebinfo",
+            BuildType::MinSizeRel => "minsizerel",
+        });
         let (path, build_type, available) =
-            detect_slang_test_build(&root_dir, args.build_type.as_deref())?;
+            detect_slang_test_build(&root_dir, preferred)?;
 
         // Only show build selection info if user didn't explicitly choose and multiple are available
         if available.len() > 1 && args.build_type.is_none() {

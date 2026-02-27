@@ -100,14 +100,15 @@ sti -g 0
 - `--ignore <PATTERN>` - Ignore tests matching regex pattern (can be specified multiple times; union: ignored if matches ANY)
 - `--api <API>` - Only run tests for specific APIs (can be specified multiple times; union: runs if matches ANY). Examples: `--api vk --api cuda`
 - `--ignore-api <API>` - Exclude tests for specific APIs (can be specified multiple times; union: excluded if matches ANY). Examples: `--ignore-api metal`
-- `--diff <TOOL>` - Diff tool for expected/actual differences: `none`, `diff`, `difft`, `auto` (default: `auto`, prefers `difft` if available)
+- `--diff <TOOL>` - Diff tool for expected/actual differences: `none`, `diff`, `git`, `difft`, `auto` (default: `auto`, fallback chain: difft → git → diff → none)
+- `--color <MODE>` - Color output mode: `auto`, `always`, `never` (default: `auto`, uses terminal detection)
 - `-v, --verbose` - Verbose output: show per-worker progress (which test each worker is running), CPU/GPU load, batch reproduction commands for slow batches, slowest tests report, and batch size histogram
 - `-- <ARGS>` - Additional arguments to pass directly to slang-test (e.g., `-- -api vk`)
 
 ### Build selection
 
 - `--slang-test <PATH>` - Path to slang-test executable (default: auto-detects newest build)
-- `--build-type <TYPE>` - Build type to use: debug, release, or relwithdebinfo (default: newest available)
+- `--build-type <TYPE>` - Build type to use: debug, release, relwithdebinfo, or minsizerel (default: newest available)
 
 ### Advanced options
 

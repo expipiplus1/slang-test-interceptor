@@ -59,11 +59,11 @@ fn strip_ansi_prefix(s: &str) -> &str {
     rest
 }
 
-/// Resolve "auto" diff tool to actual tool name.
-/// Fallback chain: difft → git → diff → none
-fn resolve_diff_tool(tool: &str) -> &str {
+/// Resolve DiffTool enum to actual tool name string.
+/// For Auto: fallback chain is difft → git → diff → none
+fn resolve_diff_tool(tool: crate::DiffTool) -> &'static str {
     match tool {
-        "auto" => {
+        crate::DiffTool::Auto => {
             if *DIFFT_AVAILABLE {
                 "difft"
             } else if *GIT_AVAILABLE {
@@ -74,7 +74,10 @@ fn resolve_diff_tool(tool: &str) -> &str {
                 "none"
             }
         }
-        other => other,
+        crate::DiffTool::Difft => "difft",
+        crate::DiffTool::Git => "git",
+        crate::DiffTool::Diff => "diff",
+        crate::DiffTool::None => "none",
     }
 }
 
@@ -1849,7 +1852,7 @@ impl TestRunner {
             }
 
             // Compute diffs only for the representative failure in each group (not per-failure)
-            let diff_tool = resolve_diff_tool(self.args.diff.as_str());
+            let diff_tool = resolve_diff_tool(self.args.diff);
             let machine_output = self.machine_output;
             let diff_results: Vec<Option<String>> = if diff_tool != "none" {
                 let handles: Vec<_> = groups
@@ -1923,69 +1926,59 @@ impl TestRunner {
         let not_run = total_tests.saturating_sub(passed + failed + ignored);
 
         if total_run > 0 {
-            // Colorize counts when non-zero
-            let passed_str = if passed > 0 {
-                passed.to_string().green().to_string()
+            // Calculate percentage
+            let pass_pct = (passed as f64 / total_run as f64) * 100.0;
+            let pct_str = if passed == 0 {
+                "0%".to_string()
+            } else if passed == total_run {
+                "100%".to_string()
             } else {
-                passed.to_string()
-            };
-            let failed_str = if failed > 0 {
-                failed.to_string().red().to_string()
-            } else {
-                failed.to_string()
+                format!("{:.1}%", pass_pct)
             };
 
-            if interrupted {
-                if failed == 0 {
-                    println!(
-                        "{}: {} passed, {} ignored, {} not run in {:.1}s",
-                        "Interrupted".yellow().bold(),
-                        passed_str,
-                        ignored,
-                        not_run,
-                        elapsed.as_secs_f64()
-                    );
-                } else {
-                    println!(
-                        "{}: {} passed, {} failed, {} ignored, {} not run in {:.1}s",
-                        "Interrupted".yellow().bold(),
-                        passed_str,
-                        failed_str,
-                        ignored,
-                        not_run,
-                        elapsed.as_secs_f64()
-                    );
-                }
+            // Colorize counts when non-zero (color the whole phrase)
+            let passed_str = if passed > 0 {
+                format!("{} passed ({})", passed, pct_str).green().to_string()
             } else {
-                let pass_pct = (passed as f64 / total_run as f64) * 100.0;
-                // Use 1 decimal place for partial results to avoid misleading 0%/100%
-                let pct_str = if passed == 0 {
-                    "0".to_string()
-                } else if passed == total_run {
-                    "100".to_string()
-                } else {
-                    format!("{:.1}", pass_pct)
-                };
-                if failed == 0 {
-                    println!(
-                        "{}: {}% passed ({} passed, {} ignored) in {:.1}s",
-                        "OK".green().bold(),
-                        pct_str,
-                        passed_str,
-                        ignored,
-                        elapsed.as_secs_f64()
-                    );
-                } else {
-                    println!(
-                        "{}: {}% passed ({} passed, {} failed, {} ignored) in {:.1}s",
-                        "FAILED".red().bold(),
-                        pct_str,
-                        passed_str,
-                        failed_str,
-                        ignored,
-                        elapsed.as_secs_f64()
-                    );
-                }
+                format!("{} passed ({})", passed, pct_str)
+            };
+            let failed_str = if failed > 0 {
+                format!("{} failed", failed).red().to_string()
+            } else {
+                format!("{} failed", failed)
+            };
+            let ignored_str = format!("{} ignored", ignored).dimmed().to_string();
+            let not_run_str = format!("{} not run", not_run).dimmed().to_string();
+            let time_str = format!("in {:.1}s", elapsed.as_secs_f64()).dimmed().to_string();
+
+            if interrupted {
+                println!(
+                    "{}: {}, {}, {}, {}, {}",
+                    "Interrupted".yellow().bold(),
+                    passed_str,
+                    failed_str,
+                    ignored_str,
+                    not_run_str,
+                    time_str,
+                );
+            } else if failed == 0 {
+                println!(
+                    "{}: {}, {}, {}, {}",
+                    "OK".green().bold(),
+                    passed_str,
+                    failed_str,
+                    ignored_str,
+                    time_str,
+                );
+            } else {
+                println!(
+                    "{}: {}, {}, {}, {}",
+                    "Failed".red().bold(),
+                    passed_str,
+                    failed_str,
+                    ignored_str,
+                    time_str,
+                );
             }
         } else {
             println!("No tests run");
@@ -2004,7 +1997,7 @@ impl TestRunner {
             if !observed.is_empty() {
                 let mut slowest: Vec<_> = observed.iter().collect();
                 slowest.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
-                slowest.truncate(15);
+                slowest.truncate(8);
 
                 if !slowest.is_empty() && *slowest[0].1 > 1.0 {
                     println!("\n{}:", "Slowest tests".yellow());
@@ -2016,10 +2009,12 @@ impl TestRunner {
                 }
             }
 
-            let batch_sizes = self.stats.get_batch_sizes();
-            if !batch_sizes.is_empty() {
-                println!("\n{}:", "Batch size distribution".yellow());
-                self.print_batch_histogram(&batch_sizes);
+            if *crate::types::DEBUG_ENABLED {
+                let batch_sizes = self.stats.get_batch_sizes();
+                if !batch_sizes.is_empty() {
+                    println!("\n{}:", "Batch size distribution".yellow());
+                    self.print_batch_histogram(&batch_sizes);
+                }
             }
         }
 
