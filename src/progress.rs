@@ -317,7 +317,7 @@ impl ProgressDisplay {
                 let count_width = self.total_files.max(1).to_string().len();
 
                 let eta = match adjusted_eta {
-                    Some(secs) if secs > 1.0 => format!(" \x1b[2m|\x1b[0m ETA: {:>6.1}s", secs),
+                    Some(secs) if secs > 1.0 => format!(" \x1b[2m|\x1b[0m ETA: {:>4.0}s", secs),
                     Some(_) => " \x1b[2m|\x1b[0m ETA:    <1s".to_string(),
                     None => String::new(),
                 };
@@ -335,7 +335,7 @@ impl ProgressDisplay {
             // Format ETA string (velocity-adjusted)
             let eta = match adjusted_eta {
                 Some(secs) if secs > 1.0 && tests_remaining > 0 => {
-                    format!(" \x1b[2m|\x1b[0m ETA: {:.1}s", secs)
+                    format!(" \x1b[2m|\x1b[0m ETA: {:.0}s", secs)
                 }
                 Some(_) if tests_remaining > 0 => {
                     " \x1b[2m|\x1b[0m ETA: <1s".to_string()
