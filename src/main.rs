@@ -102,6 +102,10 @@ pub struct Args {
     #[arg(long, default_value_t = 2)]
     pub retries: usize,
 
+    /// Retry crashing tests as though they are regular failures instead
+    #[arg(long)]
+    pub retry_crashes: bool,
+
     /// Test filter regexes (union: test runs if it matches ANY filter; if empty, runs all tests)
     /// Examples: "^tests/compute" (prefix), "diagnostic" (infix), "\.slang$" (suffix)
     #[arg()]
@@ -120,6 +124,12 @@ pub struct Args {
     /// Examples: --ignore-api vk --ignore-api metal
     #[arg(long = "ignore-api")]
     pub ignore_apis: Vec<String>,
+
+    /// File containing expected test failures. Can be specified multiple times.
+    /// Each file should contain one test per line; lines starting with # are comments.
+    /// Test format matches slang-test output: "path/test.slang.N [syn] [(api)]"
+    #[arg(long = "expected-failures", value_name = "FILE", action = clap::ArgAction::Append)]
+    pub expected_failure_lists: Vec<PathBuf>,
 
     /// Diff tool for showing expected/actual differences
     #[arg(long, value_enum, default_value_t = DiffTool::Auto)]
@@ -376,6 +386,7 @@ fn main() -> Result<()> {
         ignore_patterns: &args.ignore_patterns,
         apis: &args.apis,
         ignore_apis: &args.ignore_apis,
+        expected_failure_lists: &args.expected_failure_lists,
         no_early_api_check: args.no_early_api_check,
         no_timing_cache: args.no_timing_cache,
         build_type,
@@ -399,8 +410,67 @@ fn main() -> Result<()> {
         } else {
             String::new()
         };
-        eprintln!("{} tests would be run{}", discovery_result.tests.len(), ignored_msg);
+        let expected_msg = if !discovery_result.expected_failures.is_empty() {
+            format!(
+                " ({} expected failures)",
+                discovery_result.expected_failures.len()
+            )
+        } else {
+            String::new()
+        };
+        eprintln!("{} tests would be run{}{}", discovery_result.tests.len(), ignored_msg, expected_msg);
         std::process::exit(0);
+    }
+
+    // Validate that explicitly requested APIs are supported
+    if let Some(ref apis) = discovery_result.unsupported_apis {
+        if apis.check_completed {
+            // Helper to print supported APIs and exit
+            let print_error_and_exit = |msg: &str| {
+                eprintln!("{}: {}", "Error".red().bold(), msg);
+                let mut supported_list: Vec<_> = apis.supported.iter().collect();
+                supported_list.sort();
+                eprintln!("Supported APIs: {}", supported_list.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+                std::process::exit(1);
+            };
+
+            // Validate --api arguments
+            for requested_api in &args.apis {
+                let api_lower = requested_api.to_lowercase();
+                if apis.unsupported.contains(&api_lower) {
+                    print_error_and_exit(&format!(
+                        "Requested API '{}' is not supported on this system.",
+                        requested_api
+                    ));
+                }
+                // Also check if the API is completely unknown (not in supported or unsupported)
+                if !apis.supported.contains(&api_lower) {
+                    print_error_and_exit(&format!(
+                        "Requested API '{}' is not recognized by slang-test.",
+                        requested_api
+                    ));
+                }
+            }
+
+            // Warn about --ignore-api arguments that don't match any known API
+            for ignored_api in &args.ignore_apis {
+                let api_lower = ignored_api.to_lowercase();
+                if !apis.supported.contains(&api_lower) && !apis.unsupported.contains(&api_lower) {
+                    // List all known APIs (both supported and unsupported) since any can be ignored
+                    let mut all_apis: Vec<_> = apis.supported.iter().chain(apis.unsupported.iter()).collect();
+                    all_apis.sort();
+                    all_apis.dedup();
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "Warning: Ignored API '{}' is not recognized by slang-test. Valid APIs: {}",
+                            ignored_api,
+                            all_apis.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                        ).dimmed()
+                    );
+                }
+            }
+        }
     }
 
     // Create TestRunner with pre-discovered data

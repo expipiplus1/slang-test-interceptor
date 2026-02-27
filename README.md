@@ -100,6 +100,7 @@ sti -g 0
 - `--ignore <PATTERN>` - Ignore tests matching regex pattern (can be specified multiple times; union: ignored if matches ANY)
 - `--api <API>` - Only run tests for specific APIs (can be specified multiple times; union: runs if matches ANY). Examples: `--api vk --api cuda`
 - `--ignore-api <API>` - Exclude tests for specific APIs (can be specified multiple times; union: excluded if matches ANY). Examples: `--ignore-api metal`
+- `--expected-failures <FILE>` - File containing tests expected to fail (can be specified multiple times). Tests in these files still run, but failures don't count toward the exit code. See Expected Failures section below.
 - `--diff <TOOL>` - Diff tool for expected/actual differences: `none`, `diff`, `git`, `difft`, `auto` (default: `auto`, fallback chain: difft → git → diff → none)
 - `--color <MODE>` - Color output mode: `auto`, `always`, `never` (default: `auto`, uses terminal detection)
 - `-v, --verbose` - Verbose output: show per-worker progress (which test each worker is running), CPU/GPU load, batch reproduction commands for slow batches, slowest tests report, and batch size histogram
@@ -112,7 +113,8 @@ sti -g 0
 
 ### Advanced options
 
-- `--retries <N>` - Number of retries for failed tests (default: 2).
+- `--retries <N>` - Number of retries for failed tests (default: 2)
+- `--retry-crashes` - Retry crashing tests as regular failures instead of blaming the first unaccounted test.
 - `--batch-size <N>` - Maximum tests per slang-test invocation (default: auto-calculated as `(num_tests/jobs)*2` with timing data, or `min(50, num_tests/jobs)` without)
 - `--batch-duration <SECS>` - Target batch duration in seconds when timing data is available (default: auto-calculated as `predicted_runtime/2`, minimum 1.0)
 - `--no-timing-cache` - Ignore cached timing data for scheduling and ETA

@@ -40,10 +40,9 @@ static DIFFT_AVAILABLE: LazyLock<bool> = LazyLock::new(|| is_command_available("
 static GIT_AVAILABLE: LazyLock<bool> = LazyLock::new(|| is_command_available("git", &["--version"]));
 static DIFF_AVAILABLE: LazyLock<bool> = LazyLock::new(|| is_command_available("diff", &["--version"]));
 
-/// Get terminal width for diff output (cached at startup, None if not a TTY)
-/// Subtracts 2 for the indent prefix added to diff output
+/// Get terminal width (cached at startup, None if not a TTY)
 static TERM_WIDTH: LazyLock<Option<usize>> = LazyLock::new(|| {
-    terminal_size().map(|(Width(w), _)| w.saturating_sub(2) as usize)
+    terminal_size().map(|(Width(w), _)| w as usize)
 });
 
 /// Strip leading ANSI escape codes from a string (for line matching)
@@ -372,6 +371,7 @@ pub fn parse_failure_info(test_name: &str, lines: &[String]) -> FailureInfo {
     FailureInfo {
         test_name: test_name.to_string(),
         content,
+        expected: false, // Will be updated by caller if needed
     }
 }
 
@@ -477,11 +477,12 @@ fn should_retry_test(
 fn process_outcome(
     outcome: TestOutcome,
     ctx: &BatchContext,
-    failed_outcomes: &mut Vec<TestOutcome>,
 ) -> bool {
     if let Some(base_file) = extract_base_test_file(&outcome.name) {
         ctx.stats.record_file(&base_file);
     }
+
+    let is_expected_failure = ctx.stats.is_expected_failure(&outcome.name);
 
     match outcome.result {
         TestResult::Passed => {
@@ -489,6 +490,11 @@ fn process_outcome(
             ctx.stats.passed.fetch_add(1, Ordering::SeqCst);
             if was_retry {
                 ctx.stats.retried_and_passed.fetch_add(1, Ordering::SeqCst);
+            }
+            // Track unexpected passes (expected to fail but passed)
+            if is_expected_failure {
+                ctx.stats.unexpected_passed.fetch_add(1, Ordering::SeqCst);
+                ctx.stats.unexpected_pass_names.lock().unwrap().push(outcome.name.clone());
             }
             false
         }
@@ -500,8 +506,16 @@ fn process_outcome(
             if should_retry_test(&outcome, ctx.max_retries, ctx.retried_tests, ctx.scheduler) {
                 return true;
             }
-            ctx.stats.failed.fetch_add(1, Ordering::SeqCst);
-            failed_outcomes.push(outcome);
+            // Track expected vs unexpected failures
+            if is_expected_failure {
+                ctx.stats.expected_failed.fetch_add(1, Ordering::SeqCst);
+            } else {
+                ctx.stats.failed.fetch_add(1, Ordering::SeqCst);
+            }
+            // Always record failure for display, marking whether expected
+            let mut failure_info = parse_failure_info(&outcome.name, &outcome.failure_output);
+            failure_info.expected = is_expected_failure;
+            ctx.failures.lock().unwrap().push(failure_info);
             false
         }
     }
@@ -583,7 +597,8 @@ fn handle_incomplete_batch(
     // Determine if this was a test-caused crash or an external kill
     let test_caused = killed_for_timeout || is_test_caused_crash(exit_status.as_ref());
 
-    if test_caused {
+    // With --retry-crashes, treat test-caused crashes like external kills (repool all)
+    if test_caused && !ctx.retry_crashes {
         // Test caused the crash/timeout - blame the first unaccounted test, repool the rest
         let crashed_test = unaccounted_tests.first().cloned();
         let tests_to_repool: Vec<String> = unaccounted_tests.iter().skip(1).cloned().collect();
@@ -595,16 +610,28 @@ fn handle_incomplete_batch(
         ctx.scheduler.add_tests(tests_to_repool.clone());
 
         if let Some(test) = crashed_test {
+            let is_expected_failure = ctx.stats.is_expected_failure(&test);
             let error_type = if killed_for_timeout { "timed out" } else { "crashed" };
-            eprintln!(
-                "\n{}: slang-test {} ({}), skipping: {}",
-                "ERROR".red(),
-                error_type, exit_info, test
-            );
-            if !tests_to_repool.is_empty() {
-                eprintln!("  Repooling {} subsequent tests", tests_to_repool.len());
+
+            // Only print error for unexpected failures
+            if !is_expected_failure {
+                eprintln!(
+                    "\n{}: slang-test {} ({}), skipping: {}",
+                    "ERROR".red(),
+                    error_type, exit_info, test
+                );
+                if !tests_to_repool.is_empty() {
+                    eprintln!("  Repooling {} subsequent tests", tests_to_repool.len());
+                }
             }
-            ctx.stats.failed.fetch_add(1, Ordering::SeqCst);
+
+            // Track expected vs unexpected failures
+            if is_expected_failure {
+                ctx.stats.expected_failed.fetch_add(1, Ordering::SeqCst);
+            } else {
+                ctx.stats.failed.fetch_add(1, Ordering::SeqCst);
+            }
+            // Always record failure for display
             let failure_msg = if killed_for_timeout {
                 format!("Test timed out ({})", exit_info)
             } else {
@@ -613,6 +640,7 @@ fn handle_incomplete_batch(
             ctx.failures.lock().unwrap().push(FailureInfo {
                 test_name: test.clone(),
                 content: FailureContent::Output { lines: vec![failure_msg] },
+                expected: is_expected_failure,
             });
 
             // Record timing for crashed/timed-out test using actual elapsed time
@@ -780,7 +808,6 @@ fn monitor_batch_execution(
     batch_id: std::thread::ThreadId,
     test_time_sum: &std::sync::atomic::AtomicU64,
     test_count: &AtomicUsize,
-    failed_outcomes: &mut Vec<TestOutcome>,
     worker_state: Option<&WorkerState>,
 ) -> BatchMonitorResult {
     let start = Instant::now();
@@ -833,7 +860,7 @@ fn monitor_batch_execution(
                 ctx.scheduler.test_completed(ctx.batch_id, predicted, actual_duration.as_secs_f64());
             }
 
-            process_outcome(outcome, ctx, failed_outcomes);
+            process_outcome(outcome, ctx);
 
             if let Some(state) = worker_state {
                 state.advance();
@@ -889,7 +916,6 @@ fn drain_remaining_outcomes(
     channels: &OutputReaderChannels,
     ctx: &BatchContext,
     seen_tests: &mut HashSet<String>,
-    failed_outcomes: &mut Vec<TestOutcome>,
 ) {
     debug_log!("drain: draining remaining outcomes");
     let mut drained_count = 0;
@@ -908,7 +934,7 @@ fn drain_remaining_outcomes(
             ctx.scheduler.test_completed(ctx.batch_id, predicted, actual_duration.as_secs_f64());
         }
 
-        process_outcome(outcome, ctx, failed_outcomes);
+        process_outcome(outcome, ctx);
     }
     debug_log!("drain: drained {} outcomes", drained_count);
 
@@ -957,6 +983,7 @@ pub fn run_batch_with_pool(
     verbose: bool,
     worker_state: Option<&WorkerState>,
     batch_id: usize,
+    retry_crashes: bool,
 ) {
     let ctx = BatchContext {
         slang_test,
@@ -972,6 +999,7 @@ pub fn run_batch_with_pool(
         running,
         verbose,
         batch_id,
+        retry_crashes,
     };
 
     // Track current test for progress display
@@ -1044,7 +1072,6 @@ pub fn run_batch_with_pool(
     let output_reader = spawn_output_reader(pipe_reader);
 
     // Monitor batch execution
-    let mut failed_outcomes: Vec<TestOutcome> = Vec::new();
     let expected_test_count = ctx.test_files.len();
     let monitor_start = Instant::now();
 
@@ -1056,7 +1083,6 @@ pub fn run_batch_with_pool(
         batch_id,
         &test_time_sum,
         &test_count,
-        &mut failed_outcomes,
         worker_state,
     );
 
@@ -1076,18 +1102,12 @@ pub fn run_batch_with_pool(
     let join_result = output_reader.thread_handle.join();
     debug_log!("drain: output thread joined with result {:?}", join_result.is_ok());
 
-    drain_remaining_outcomes(&output_reader.channels, &ctx, &mut monitor_result.seen_tests, &mut failed_outcomes);
+    drain_remaining_outcomes(&output_reader.channels, &ctx, &mut monitor_result.seen_tests);
 
     // Handle incomplete batches (crash/timeout)
     let all_tests_seen = monitor_result.seen_tests.len() >= expected_test_count;
     if !all_tests_seen && !is_interrupted() {
         handle_incomplete_batch(&ctx, &monitor_result.seen_tests, monitor_result.exit_status, monitor_result.killed_for_timeout, loop_time);
-    }
-
-    // Store failure info
-    for outcome in failed_outcomes {
-        let info = parse_failure_info(&outcome.name, &outcome.failure_output);
-        ctx.failures.lock().unwrap().push(info);
     }
 
     // Clear worker state at end of batch
@@ -1322,6 +1342,7 @@ fn spawn_worker_thread(
     shutdown: Arc<AtomicBool>,
     verbose: bool,
     worker_states: Option<Arc<WorkerStates>>,
+    retry_crashes: bool,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name(format!("worker-{}", worker_id))
@@ -1360,6 +1381,7 @@ fn spawn_worker_thread(
                         verbose,
                         my_state,
                         assignment.batch_id,
+                        retry_crashes,
                     );
                     debug_log!("batch {} completed, calling complete_batch", assignment.batch_id);
                     scheduler_handle.complete_batch(assignment.batch_id);
@@ -1444,9 +1466,12 @@ impl TestRunner {
         let machine_output = !crate::is_stderr_tty();
         let build_type = args.slang_test.as_ref()
             .and_then(|p| BuildType::from_path(p));
+        let stats = Arc::new(TestStats::default());
+        // Initialize expected failures in stats for access during batch processing
+        stats.set_expected_failures(discovery.expected_failures);
         Self {
             args,
-            stats: Arc::new(TestStats::default()),
+            stats,
             failures: Arc::new(Mutex::new(Vec::new())),
             retried_tests: Arc::new(Mutex::new(HashMap::new())),
             machine_output,
@@ -1637,6 +1662,7 @@ impl TestRunner {
                     shutdown.clone(),
                     self.args.verbose,
                     worker_states.clone(),
+                    self.args.retry_crashes,
                 );
                 handles.push(handle);
             }
@@ -1713,10 +1739,10 @@ impl TestRunner {
 
     /// Compute diff output for the given tool.
     /// Handles: difft, git, diff (unified), with appropriate line filtering.
-    fn compute_diff(tool: &str, expected: &str, actual: &str, machine_output: bool) -> String {
+    fn compute_diff(tool: &str, expected: &str, actual: &str, use_color: bool, use_indent: bool) -> String {
         use std::io::Write as _;
 
-        let indent = if machine_output { "" } else { "  " };
+        let indent = if use_indent { "  " } else { "" };
 
         let id = std::process::id();
         let thread_id = format!("{:?}", std::thread::current().id());
@@ -1733,16 +1759,15 @@ impl TestRunner {
             let _ = af.write_all(actual.as_bytes());
 
             // Build command based on tool
-            // Only use color when outputting to a terminal (not machine_output)
-            let color_arg = if machine_output { "never" } else { "always" };
+            let color_arg = if use_color { "always" } else { "never" };
             let output = match tool {
                 "difft" => {
                     let mut cmd = Command::new("difft");
                     cmd.arg("--color").arg(color_arg);
                     if let Some(w) = *TERM_WIDTH {
-                        if !machine_output {
-                            cmd.arg("--width").arg(w.to_string());
-                        }
+                        // Subtract indent width (2 spaces) when indenting
+                        let effective_width = if use_indent { w.saturating_sub(2) } else { w };
+                        cmd.arg("--width").arg(effective_width.to_string());
                     }
                     cmd.arg(&expected_file).arg(&actual_file).output()
                 }
@@ -1815,6 +1840,8 @@ impl TestRunner {
     fn print_summary(&self, elapsed: Duration) {
         let passed = self.stats.passed.load(Ordering::SeqCst);
         let failed = self.stats.failed.load(Ordering::SeqCst);
+        let expected_failed = self.stats.expected_failed.load(Ordering::SeqCst);
+        let unexpected_passed = self.stats.unexpected_passed.load(Ordering::SeqCst);
         let ignored = self.stats.ignored.load(Ordering::SeqCst);
         let retried = self.stats.retried_and_passed.load(Ordering::SeqCst);
 
@@ -1836,9 +1863,9 @@ impl TestRunner {
 
             let mut groups: Vec<FailureGroup> = Vec::new();
             for failure in &sorted_failures {
-                // FailureContent derives PartialEq, so we can compare directly
+                // Group by content AND expected status (so expected/unexpected are shown separately)
                 let should_group = groups.last().map_or(false, |last| {
-                    last.failure.content == failure.content
+                    last.failure.content == failure.content && last.failure.expected == failure.expected
                 });
 
                 if should_group {
@@ -1853,7 +1880,13 @@ impl TestRunner {
 
             // Compute diffs only for the representative failure in each group (not per-failure)
             let diff_tool = resolve_diff_tool(self.args.diff);
-            let machine_output = self.machine_output;
+            let use_indent = !self.machine_output;
+            // Use color based on --color argument
+            let use_color = match self.args.color {
+                crate::ColorMode::Always => true,
+                crate::ColorMode::Never => false,
+                crate::ColorMode::Auto => colored::control::SHOULD_COLORIZE.should_colorize(),
+            };
             let diff_results: Vec<Option<String>> = if diff_tool != "none" {
                 let handles: Vec<_> = groups
                     .iter()
@@ -1863,7 +1896,7 @@ impl TestRunner {
                             let actual = actual.clone();
                             let tool = diff_tool.to_string();
                             Some(thread::spawn(move || {
-                                Self::compute_diff(&tool, &expected, &actual, machine_output)
+                                Self::compute_diff(&tool, &expected, &actual, use_color, use_indent)
                             }))
                         } else {
                             None
@@ -1881,10 +1914,14 @@ impl TestRunner {
 
             // Print grouped failures: all test names first, then the single diff
             for (group, diff_output) in groups.iter().zip(diff_results.iter()) {
-                // Print all test names in this group
+                // Print all test names in this group (yellow if expected, red if unexpected)
                 println!();
                 for test_name in &group.test_names {
-                    println!("{}", test_name.red().bold().underline());
+                    if group.failure.expected {
+                        println!("{}", test_name.yellow().bold().underline());
+                    } else {
+                        println!("{}", test_name.red().bold().underline());
+                    }
                 }
 
                 match &group.failure.content {
@@ -1920,17 +1957,19 @@ impl TestRunner {
 
         println!("\n{}", "=".repeat(70));
 
-        let total_run = passed + failed;
+        let total_failed = failed + expected_failed;
+        let total_run = passed + total_failed;
         let interrupted = is_interrupted();
         let total_tests = self.stats.get_test_files().len();
-        let not_run = total_tests.saturating_sub(passed + failed + ignored);
+        let not_run = total_tests.saturating_sub(passed + total_failed + ignored);
 
         if total_run > 0 {
-            // Calculate percentage
-            let pass_pct = (passed as f64 / total_run as f64) * 100.0;
-            let pct_str = if passed == 0 {
+            // Calculate percentage (count expected failures as passed for pass rate)
+            let effective_passed = passed + expected_failed;
+            let pass_pct = (effective_passed as f64 / total_run as f64) * 100.0;
+            let pct_str = if effective_passed == 0 {
                 "0%".to_string()
-            } else if passed == total_run {
+            } else if effective_passed == total_run {
                 "100%".to_string()
             } else {
                 format!("{:.1}%", pass_pct)
@@ -1942,10 +1981,13 @@ impl TestRunner {
             } else {
                 format!("{} passed ({})", passed, pct_str)
             };
+            // Red for unexpected failures, yellow for expected-only
             let failed_str = if failed > 0 {
-                format!("{} failed", failed).red().to_string()
+                format!("{} failed", total_failed).red().to_string()
+            } else if expected_failed > 0 {
+                format!("{} failed", total_failed).yellow().to_string()
             } else {
-                format!("{} failed", failed)
+                format!("{} failed", total_failed)
             };
             let ignored_str = format!("{} ignored", ignored).dimmed().to_string();
             let not_run_str = format!("{} not run", not_run).dimmed().to_string();
@@ -1962,6 +2004,7 @@ impl TestRunner {
                     time_str,
                 );
             } else if failed == 0 {
+                // No unexpected failures - OK (even if there are expected failures)
                 println!(
                     "{}: {}, {}, {}, {}",
                     "OK".green().bold(),
@@ -1982,6 +2025,28 @@ impl TestRunner {
             }
         } else {
             println!("No tests run");
+        }
+
+        // Show expected failure details if any
+        if expected_failed > 0 || unexpected_passed > 0 {
+            let indent = if self.machine_output { "" } else { "  " };
+            if expected_failed > 0 {
+                println!("{}({} expected failures)", indent, expected_failed);
+            }
+            if unexpected_passed > 0 {
+                let unexpected_names = self.stats.unexpected_pass_names.lock().unwrap();
+                println!("{}({} unexpected passes)", indent, unexpected_passed);
+                for name in unexpected_names.iter() {
+                    // Print just path.variant without syn or (api)
+                    let test_id = TestId::parse(name);
+                    let short_name = if let Some(v) = test_id.variant {
+                        format!("{}.{}", test_id.path, v)
+                    } else {
+                        test_id.path.clone()
+                    };
+                    println!("{}  {}", indent, short_name.yellow());
+                }
+            }
         }
 
         if retried > 0 {

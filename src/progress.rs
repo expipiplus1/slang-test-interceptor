@@ -35,6 +35,15 @@ fn red(s: &str) -> String {
     }
 }
 
+/// Helper to conditionally apply ANSI yellow code
+fn yellow(s: &str) -> String {
+    if SHOULD_COLORIZE.should_colorize() {
+        format!("\x1b[33m{}\x1b[0m", s)
+    } else {
+        s.to_string()
+    }
+}
+
 /// Sentinel value meaning "no test running" (worker is idle or between batches)
 pub const WORKER_IDLE: usize = usize::MAX;
 
@@ -249,8 +258,10 @@ impl ProgressDisplay {
 
         let passed = stats.passed.load(Ordering::SeqCst);
         let failed = stats.failed.load(Ordering::SeqCst);
+        let expected_failed = stats.expected_failed.load(Ordering::SeqCst);
         let ignored = stats.ignored.load(Ordering::SeqCst);
-        let tests_done = passed + failed + ignored;
+        let tests_done = passed + failed + expected_failed + ignored;
+        let total_failed = failed + expected_failed;
         let tests_remaining = self.total_files.saturating_sub(tests_done);
         let elapsed = self.start_time.elapsed().as_secs_f64();
 
@@ -294,7 +305,7 @@ impl ProgressDisplay {
                 eprintln!(
                     "[{:>2}/{:>cw$}/{:>cw$}] {:>5.1}% | {:>cw$} passed, {:>cw$} failed, {:>cw$} ignored | Elapsed: {:>tw$.0}s{}",
                     batches_running, tests_remaining, self.total_files,
-                    percent, passed, failed, ignored, elapsed.round(), eta,
+                    percent, passed, total_failed, ignored, elapsed.round(), eta,
                     cw = count_width, tw = time_width
                 );
             }
@@ -343,16 +354,21 @@ impl ProgressDisplay {
                 String::new()
             };
 
-            // Colorize counts: green for passed, red for failed, dim for ignored (only if non-zero)
+            // Colorize counts: green for passed, red/yellow for failed, dim for ignored
+            // Red if any unexpected failures, yellow if only expected failures
             let passed_str = if passed > 0 {
                 green(&format!("{} passed", passed))
             } else {
                 format!("{} passed", passed)
             };
             let failed_str = if failed > 0 {
-                red(&format!("{} failed", failed))
+                // Has unexpected failures - show in red
+                red(&format!("{} failed", total_failed))
+            } else if expected_failed > 0 {
+                // Only expected failures - show in yellow
+                yellow(&format!("{} failed", total_failed))
             } else {
-                format!("{} failed", failed)
+                format!("{} failed", total_failed)
             };
             let ignored_str = format!("{} ignored", ignored);
 
@@ -405,13 +421,15 @@ impl ProgressDisplay {
             // Print final 100% status in machine mode
             let passed = stats.passed.load(Ordering::SeqCst);
             let failed = stats.failed.load(Ordering::SeqCst);
+            let expected_failed = stats.expected_failed.load(Ordering::SeqCst);
+            let total_failed = failed + expected_failed;
             let ignored = stats.ignored.load(Ordering::SeqCst);
             let elapsed = self.start_time.elapsed().as_secs_f64();
             let count_width = self.total_files.max(1).to_string().len();
             let time_width = self.time_width();
             eprintln!(
                 "[ 0/{:>cw$}/{:>cw$}] 100.0% | {:>cw$} passed, {:>cw$} failed, {:>cw$} ignored | Elapsed: {:>tw$.0}s",
-                0, self.total_files, passed, failed, ignored, elapsed.round(),
+                0, self.total_files, passed, total_failed, ignored, elapsed.round(),
                 cw = count_width, tw = time_width
             );
         }

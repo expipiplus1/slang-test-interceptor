@@ -37,10 +37,41 @@ pub struct DiscoveryResult {
     pub timing_cache: TimingCache,
     /// Count of tests ignored due to unsupported APIs
     pub api_ignored_count: usize,
+    /// Set of tests expected to fail (from ignore lists)
+    pub expected_failures: HashSet<String>,
     /// APIs found in tests but not in the Check output
     pub unknown_apis: HashSet<String>,
     /// Whether API check completed successfully (can skip per-batch detection)
     pub skip_api_detection: bool,
+}
+
+/// Parse an ignore list file into a set of test patterns.
+/// Lines starting with # are comments, empty lines are skipped.
+/// Returns the set of test names/patterns to ignore.
+pub fn parse_ignore_list(path: &PathBuf) -> Result<HashSet<String>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read ignore list: {}", path.display()))?;
+
+    let mut patterns = HashSet::new();
+    for line in content.lines() {
+        let line = line.trim();
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        patterns.insert(line.to_string());
+    }
+    Ok(patterns)
+}
+
+/// Load all ignore lists and merge them into a single set.
+pub fn load_ignore_lists(paths: &[PathBuf]) -> Result<HashSet<String>> {
+    let mut all_patterns = HashSet::new();
+    for path in paths {
+        let patterns = parse_ignore_list(path)?;
+        all_patterns.extend(patterns);
+    }
+    Ok(all_patterns)
 }
 
 /// Configuration for discovery
@@ -51,6 +82,7 @@ pub struct DiscoveryConfig<'a> {
     pub ignore_patterns: &'a [String],
     pub apis: &'a [String],
     pub ignore_apis: &'a [String],
+    pub expected_failure_lists: &'a [PathBuf],
     pub no_early_api_check: bool,
     pub no_timing_cache: bool,
     pub build_type: Option<BuildType>,
@@ -498,7 +530,11 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
 
     debug_log!("filtering tests by API support");
 
-    // Now apply API filtering to the collected tests
+    // Load expected failure lists (these tests will still run but failures won't count)
+    let expected_failures = load_ignore_lists(config.expected_failure_lists)?;
+    debug_log!("loaded {} expected failure patterns from ignore lists", expected_failures.len());
+
+    // Now apply API filtering to the collected tests (ignore lists don't skip tests)
     let mut api_ignored_count = 0;
     let mut unknown_apis: HashSet<String> = HashSet::new();
     let mut filtered_tests: Vec<String> = Vec::new();
@@ -516,7 +552,9 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
         filtered_tests.push(test);
     }
 
-    debug_log!("filtered {} tests, {} ignored", filtered_tests.len(), api_ignored_count);
+    // Count how many tests are expected to fail
+    let expected_failure_count = filtered_tests.iter().filter(|t| expected_failures.contains(*t)).count();
+    debug_log!("filtered {} tests, {} ignored by API, {} expected failures", filtered_tests.len(), api_ignored_count, expected_failure_count);
 
     // Sort tests for deterministic ordering
     debug_log!("sorting tests");
@@ -572,6 +610,7 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
         unsupported_apis,
         timing_cache,
         api_ignored_count,
+        expected_failures,
         unknown_apis,
         skip_api_detection,
     })

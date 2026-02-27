@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::scheduler::SchedulerHandle;
@@ -244,6 +244,10 @@ pub struct TestStats {
     pub failed: AtomicUsize,
     pub ignored: AtomicUsize,
     pub retried_and_passed: AtomicUsize,
+    /// Expected failures that actually failed (good - expected behavior)
+    pub expected_failed: AtomicUsize,
+    /// Expected failures that actually passed (notable - unexpected pass)
+    pub unexpected_passed: AtomicUsize,
     pub files_seen: Mutex<HashSet<String>>,
     pub last_test_output: Mutex<Option<Instant>>,
     pub compiling_since: Mutex<Option<Instant>>,
@@ -257,6 +261,10 @@ pub struct TestStats {
     pub execution_start_time: Mutex<Option<Instant>>,
     /// List of test files in this run (for fudge factor recording)
     pub test_files: Mutex<Vec<String>>,
+    /// Set of tests expected to fail (from expected failure lists) - set once, read-only after
+    pub expected_failures: OnceLock<HashSet<String>>,
+    /// Names of tests that were expected to fail but passed (unexpected passes)
+    pub unexpected_pass_names: Mutex<Vec<String>>,
 }
 
 impl TestStats {
@@ -345,6 +353,55 @@ impl TestStats {
     pub fn get_test_files(&self) -> Vec<String> {
         self.test_files.lock().unwrap().clone()
     }
+
+    /// Set the expected failures set (called once at initialization)
+    pub fn set_expected_failures(&self, failures: HashSet<String>) {
+        let _ = self.expected_failures.set(failures);
+    }
+
+    /// Check if a test is an expected failure.
+    /// Matches if any pattern in expected_failures matches the test.
+    /// Pattern matching rules:
+    /// - "tests/foo.slang" matches all variants/APIs of that file
+    /// - "tests/foo.slang.2" matches variant 2 with any API
+    /// - "tests/foo.slang.2 (cpu)" matches exactly that variant/API
+    /// - "tests/foo.slang.2 syn (cpu)" matches exactly that synthesized test
+    pub fn is_expected_failure(&self, test_name: &str) -> bool {
+        let Some(patterns) = self.expected_failures.get() else {
+            return false;
+        };
+
+        let test = TestId::parse(test_name);
+
+        for pattern_str in patterns {
+            let pattern = TestId::parse(pattern_str);
+
+            // Path must match (pattern path must be prefix of or equal to test path)
+            if test.path != pattern.path {
+                continue;
+            }
+
+            // If pattern specifies variant, it must match
+            if pattern.variant.is_some() && pattern.variant != test.variant {
+                continue;
+            }
+
+            // If pattern specifies synthesized, it must match
+            if pattern.synthesized && !test.synthesized {
+                continue;
+            }
+
+            // If pattern specifies API, it must match
+            if pattern.api.is_some() && pattern.api != test.api {
+                continue;
+            }
+
+            return true;
+        }
+
+        false
+    }
+
 }
 
 /// The displayable content of a test failure
@@ -360,6 +417,8 @@ pub enum FailureContent {
 pub struct FailureInfo {
     pub test_name: String,
     pub content: FailureContent,
+    /// Whether this failure was expected (from expected failure list)
+    pub expected: bool,
 }
 
 // ============================================================================
@@ -381,6 +440,8 @@ pub struct BatchContext<'a> {
     pub verbose: bool,
     /// Scheduler's batch ID (for test completion tracking)
     pub batch_id: usize,
+    /// Whether to retry crashes by repooling all tests instead of blaming first
+    pub retry_crashes: bool,
 }
 
 // ============================================================================
